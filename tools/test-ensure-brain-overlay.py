@@ -39,11 +39,18 @@ STOCK_HOOK = (
     "const session = createCursorInferencePromptSession({\n"
 )
 
-# Recovered production host (version 112ba04): Cursor-native only — no xAI branch.
+# Live recovered stock (e.g. host 9a145a6 / 112ba04): Cursor-native only — no
+# xAI branch. createCursorSandInference returns an object whose createSession
+# does `const session = createCursorInferencePromptSession(...); return session;`
+# with sibling recordPostTurnLabeling (must survive wrap without leftover `}`).
 CURSOR_NATIVE_HOOK = """
 function resolveSandRequestedModel(opts) { return (opts && opts.modelId) || "grok-4.6"; }
 function createCursorInferencePromptSession(opts) { return { kind: "cursor", opts: opts }; }
-function createSession(options2, sessionOptions, onRequestId) {
+function recordSandPostTurnLabeling() {}
+function getLabelingClient() { return {}; }
+function createCursorSandInference(options2) {
+  return {
+    createSession(onRequestId, sessionOptions) {
       const requestedModel = resolveSandRequestedModel({
         modelId: "grok-4.6",
         sessionOptions
@@ -58,8 +65,16 @@ function createSession(options2, sessionOptions, onRequestId) {
         ...sessionOptions?.lineage != null ? { lineage: sessionOptions.lineage } : {}
       });
       return session;
+    },
+    recordPostTurnLabeling(args) {
+      recordSandPostTurnLabeling(getLabelingClient(), args);
+    },
+    recordFollowupLabeling(args) {
+      recordSandPostTurnLabeling(getLabelingClient(), args);
+    }
+  };
 }
-module.exports = { createSession };
+module.exports = { createCursorSandInference };
 """
 
 
@@ -146,8 +161,17 @@ class EnsureBrainOverlayTests(unittest.TestCase):
         self.assertIn("createLazyBrainSession", host)
         self.assertIn("overlay failed, native", host)
         self.assertIn("sand-brain pass-through", host)
-        self.assertTrue((self.host_dir / "brain-router.cjs").is_file())
+        self.assertIn("sand-brain durable-router", host)
+        self.assertIn("agent-data", host)
+        # Durable router under sand-data (survives boot-fetch); sand-host copy optional.
         self.assertTrue((self.sand / "brain-router.cjs").is_file())
+        self.assertTrue((self.sand / "host-prestart-ensure.sh").is_file())
+        r = subprocess.run(
+            ["node", "--check", str(self.host_dir / "host-main.cjs")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("no changes needed", self._ensure()[1])
 
     def test_already_patched_is_noop(self):
@@ -158,25 +182,25 @@ class EnsureBrainOverlayTests(unittest.TestCase):
 
     def test_host_rewrite_missing_router_reapplies(self):
         self._ensure()
-        # Simulate recover: stock host again, bindings + durable router remain.
+        # Simulate boot-fetch: stock host again; durable sand-data router remains.
         write_stock_host(self.host_dir)
-        router = self.host_dir / "brain-router.cjs"
-        if router.exists():
-            router.unlink()
-        self.assertFalse(router.exists())
+        host_router = self.host_dir / "brain-router.cjs"
+        if host_router.exists():
+            host_router.unlink()
+        self.assertTrue((self.sand / "brain-router.cjs").is_file())
         status, out, _ = self._ensure()
         self.assertEqual(status, "applied")
-        self.assertTrue(router.is_file())
         host = (self.host_dir / "host-main.cjs").read_text(encoding="utf-8")
         self.assertIn("createLazyBrainSession", host)
+        self.assertIn("sand-brain durable-router", host)
 
-    def test_half_patch_missing_router_healed(self):
+    def test_half_patch_missing_durable_router_healed(self):
         self._ensure()
-        # Hook still present, router wiped (classic desync that bricks require()).
-        (self.host_dir / "brain-router.cjs").unlink()
+        # Wipe durable router; ensure must restore it from tools/.
+        (self.sand / "brain-router.cjs").unlink()
         status, out, _ = self._ensure()
         self.assertIn(status, ("applied", "noop"))
-        self.assertTrue((self.host_dir / "brain-router.cjs").is_file())
+        self.assertTrue((self.sand / "brain-router.cjs").is_file())
 
     def test_upstream_drift_loud_fail_restores(self):
         # Host without any createXaiPromptSession anchor.
@@ -195,8 +219,10 @@ class EnsureBrainOverlayTests(unittest.TestCase):
         self.assertEqual(
             (self.host_dir / "host-main.cjs").read_text(encoding="utf-8"), before
         )
-        self.assertFalse((self.host_dir / "brain-router.cjs").exists())
-        self.assertIn("would copy", out)
+        self.assertIn("FULL", out)
+        self.assertTrue(
+            ("would run" in out) or ("shape:" in out) or ("NEVER forceNow" in out)
+        )
 
 
 class ApplyBoxPatchTests(unittest.TestCase):
@@ -462,42 +488,85 @@ class CursorNativePatchTests(unittest.TestCase):
         self.assertIn("options2:", host)
         # Fail-closed stock path preserved inside catch.
         self.assertIn("createCursorInferencePromptSession", host)
+        self.assertIn("sand-brain durable-router", host)
+        self.assertIn("recordPostTurnLabeling(args) {", host)
         self.assertNotIn("createXaiPromptSession", host)
         self.assertNotIn('inferenceProvider !== "cursor"', host)
-        self.assertTrue((self.host_dir / "brain-router.cjs").is_file())
-        # Syntax-valid.
+        # Durable router under sand-data; sand-host copy is NOT required.
+        self.assertTrue((self.sand / "brain-router.cjs").is_file())
+        self.assertTrue((self.sand / "host-prestart-ensure.sh").is_file())
+        self.assertFalse((self.host_dir / "brain-router.cjs").is_file())
+        # FULL-file syntax gate (not a wrap slice) — fleet-killing corruption.
         r = subprocess.run(
             ["node", "--check", str(self.host_dir / "host-main.cjs")],
             capture_output=True,
             text=True,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
+        # Sibling method still present; no leftover brace before it.
+        self.assertRegex(
+            host,
+            r"return session;\s*\n\s*\}\s*\n\s*\},\s*\n\s*recordPostTurnLabeling\(args\)\s*\{",
+        )
+        self.assertNotRegex(
+            host,
+            r"return session;\s*\n\s*\}\s*\n\s*\}\s*\n\s*\},\s*\n\s*recordPostTurnLabeling",
+        )
         # Patch itself is idempotent on the bytes.
         self.assertEqual(host, self.pbh.patch(host))
+
+    def test_cursor_native_fixture_matches_live_stock_shape(self):
+        """Gate: fixture mirrors live 9a145a6 stock wrap + sibling method."""
+        text = CURSOR_NATIVE_HOOK
+        self.assertIn(
+            "const session = createCursorInferencePromptSession(", text
+        )
+        self.assertIn("return session;", text)
+        self.assertIn("recordPostTurnLabeling(args) {", text)
+        self.assertIn("createCursorSandInference", text)
+        self.assertNotIn("createXaiPromptSession", text)
+        self.assertNotIn("inferenceProvider", text)
+        self.assertEqual(self.pbh.detect_shape(text), "cursor-native")
 
     def test_cursor_native_idempotent_noop(self):
         self._ensure()
         status, out, _ = self._ensure()
         self.assertEqual(status, "noop")
         self.assertIn("no changes needed", out)
+        self.assertIn("durable-router", out)
 
-    def test_cursor_native_rewrite_reapplies(self):
+    def test_cursor_native_rewrite_reapplies_after_boot_fetch(self):
+        """Boot-fetch wipes sand-host; durable sand-data router remains."""
         self._ensure()
         write_cursor_native_host(self.host_dir)
-        router = self.host_dir / "brain-router.cjs"
-        if router.exists():
-            router.unlink()
+        host_router = self.host_dir / "brain-router.cjs"
+        if host_router.exists():
+            host_router.unlink()
+        self.assertTrue((self.sand / "brain-router.cjs").is_file())
         status, out, _ = self._ensure()
         self.assertEqual(status, "applied", out)
         host = (self.host_dir / "host-main.cjs").read_text(encoding="utf-8")
         self.assertIn("createLazyBrainSession", host)
-        self.assertTrue(router.is_file())
+        self.assertIn("sand-brain durable-router", host)
+        self.assertTrue((self.sand / "brain-router.cjs").is_file())
+        self.assertFalse(host_router.is_file())
+        r = subprocess.run(
+            ["node", "--check", str(self.host_dir / "host-main.cjs")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_cursor_native_dry_run_reports_shape(self):
         status, out, _ = self._ensure(dry_run=True)
         self.assertEqual(status, "dry-run")
         self.assertIn("cursor-native", out)
+        self.assertIn("FULL", out)
         self.assertFalse((self.host_dir / "brain-router.cjs").exists())
+        # Durable sync may copy router under sand-data even on dry-run — ok.
+        # Host must remain stock.
+        host = (self.host_dir / "host-main.cjs").read_text(encoding="utf-8")
+        self.assertNotIn("sand-brain pass-through", host)
 
     def test_cursor_native_upgrades_stale_overlay_without_id_bag(self):
         # LIVE recovered host shape: createCursorSandInference returns an object
@@ -505,6 +574,8 @@ class CursorNativePatchTests(unittest.TestCase):
         # The only const session = createCursorInferencePromptSession is INSIDE
         # the catch. Upgrading must replace the whole try/catch — not leave an
         # extra } before recordPostTurnLabeling (that caused Unexpected '{').
+        # Stale also used sand-host-relative require — upgrade must switch to
+        # durable-router loader.
         stale = r"""
 function createCursorInferencePromptSession(opts) { return { kind: "cursor", opts }; }
 function recordSandPostTurnLabeling() {}
@@ -565,6 +636,8 @@ module.exports = { createCursorSandInference };
         out = self.pbh.patch(stale)
         self.assertIn("pickSandBrainIds", out)
         self.assertIn("options2:", out)
+        self.assertIn("sand-brain durable-router", out)
+        self.assertNotIn('require("./brain-router.cjs")', out)
         # No leftover brace between catch-end and the sibling method.
         self.assertRegex(
             out,
@@ -574,7 +647,7 @@ module.exports = { createCursorSandInference };
             out,
             r"return session;\s*\n\s*\}\s*\n\s*\}\s*\n\s*\},\s*\n\s*recordPostTurnLabeling",
         )
-        # Must be valid JS (the live failure mode).
+        # Must be valid JS (the live failure mode) — FULL file, not a slice.
         with tempfile.NamedTemporaryFile("w", suffix=".cjs", delete=False) as tf:
             tf.write(out)
             tf_path = tf.name
@@ -586,6 +659,17 @@ module.exports = { createCursorSandInference };
         finally:
             os.unlink(tf_path)
         self.assertEqual(out, self.pbh.patch(out))
+
+    def test_apply_path_never_recommends_forceNow_or_update_computer(self):
+        status, out, err = self._ensure()
+        self.assertEqual(status, "applied", out)
+        blob = out + err
+        self.assertIn("Quit Grok Bot", blob)
+        self.assertRegex(blob, r"NEVER.*(forceNow|Update Grok Bot|restart-host)")
+        self.assertNotRegex(
+            blob,
+            r"(?i)(run|use|do)\s+.*(Update Grok Bot.?s Computer|forceNow|adapters restart-host)",
+        )
 
     def test_patch_prefers_xai_when_both_present(self):
         # xAI shape also contains a createCursorInferencePromptSession call;
@@ -608,6 +692,7 @@ module.exports = { createCursorSandInference };
         out = self.pbh.patch(text)
         self.assertIn("createXaiPromptSession", out)
         self.assertIn("createLazyBrainSession", out)
+        self.assertIn("sand-brain durable-router", out)
         self.assertEqual(out, self.pbh.patch(out))
 
 

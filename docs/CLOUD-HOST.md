@@ -131,16 +131,26 @@ The `model-bindings.json` + `apply-box-patch.py` path above is Contract A/B for
 openai-hop sessions. The **per-Bot brain hop** (DeepSeek via `brain-router.cjs`)
 is a separate overlay — see `tools/BRAIN-SETUP.txt`. Same survival rule:
 
-| Lives across Computer recover? | Path |
+| Lives across Computer recover / boot-fetch? | Path |
 |---|---|
-| Yes (durable) | `~/sand-data/brain-bindings.json`, durable `brain-router.cjs`, `ensure-brain-overlay.py`, `deepseek.env` |
+| Yes (durable) | `~/sand-data/brain-bindings.json`, `~/sand-data/brain-router.cjs` (or `~/agent-data/…`), `ensure-brain-overlay.py`, `host-prestart-ensure.sh`, `deepseek.env` |
 | No (rewritten stock) | `~/sand-host/host-main.cjs`, `~/sand-host/brain-router.cjs` |
 
-After recover the host is stock again while bindings/labels still say DeepSeek.
-That desync is **F19**. Do **not** hand-edit `host-main.cjs`. Re-apply:
+After recover / Update Computer / boot-fetch the host is stock again while
+bindings/labels still say DeepSeek. That desync is **F19**.
+
+**Do not** hand-edit the ~25MB `host-main.cjs`. **Do not** apply a hop by
+patching then `forceNow` / `./adapters restart-host` / Update Computer — that
+path twice took down the fleet; Update Computer is recover (boots baked host,
+boot-fetches latest, wipes sand-host), not apply.
+
+Safe re-apply:
 
 ```bash
-# on the box — safe after every recover; no-op when already healthy
+# preferred after boot-fetch: run BEFORE node starts host-main
+~/sand-data/host-prestart-ensure.sh
+
+# or manually (idempotent; no-op when healthy), then Quit Grok Bot and reopen
 python3 ~/sand-data/ensure-brain-overlay.py
 # or from a clone with paths set:
 python3 tools/doctor.py --fix
@@ -152,7 +162,7 @@ python3 tools/doctor.py --fix
 | Shape | How we know | Wrap site |
 |---|---|---|
 | grok-bot-setup | `createXaiPromptSession` + `inferenceProvider !== "cursor"` | replace that if-block |
-| recovered Cursor-native (e.g. host version `112ba04`) | no xAI branch; `const session = createCursorInferencePromptSession({...}); return session;` | wrap that call/return; `nativeFactory` is the same invocation; harvest `options2` / `sessionOptions` agent ids via `pickSandBrainIds` |
+| recovered Cursor-native (e.g. `112ba04`, `9a145a6`) | no xAI branch; `const session = createCursorInferencePromptSession({...}); return session;` beside `recordPostTurnLabeling` | wrap that call/return; load router from sand-data/agent-data; `nativeFactory` is the same invocation; harvest ids via `pickSandBrainIds` |
 
 If conversation id is empty at `createSession` (common on recovered hosts —
 `conversationIdKey` / `getConversationId` are out of scope), the router **defers**
@@ -162,11 +172,15 @@ matches those UUIDs from `sessionOptions.agentId` / `options2.getAgentId()` / st
 
 Fail-closed rules:
 
-1. **Backup first** — timestamped dir under `sand-data/`.
-2. **Verify** — host must contain `sand-brain pass-through`, `createLazyBrainSession`,
-   and `overlay failed, native` (native catch so a missing router cannot brick the fleet).
-3. **Restore on failure** — any post-write error restores `host-main` from the backup;
-   never leave a half patch.
-4. **Runtime** — hop create/key errors log loudly and fall back to native Grok;
+1. **Durable router** — `brain-router.cjs` under sand-data/agent-data; host hook
+   uses `sand-brain durable-router` loader (fail → native).
+2. **Backup first** — timestamped dir under `sand-data/`.
+3. **FULL-file `node --check`** — never gate on a wrap slice alone (that hid
+   fleet-killing corruption).
+4. **Restore on failure** — any post-write error restores `host-main`; never
+   leave a half patch.
+5. **Runtime** — hop create/key errors log loudly and fall back to native Grok;
    unassigned bots never enter the hop path.
-5. **Keys stay off git** — `~/sand-data/deepseek.env` only (`chmod 600`).
+6. **Keys stay off git** — `~/sand-data/deepseek.env` only (`chmod 600`).
+7. **Reload** — Quit Grok Bot and reopen, or prestart before node — never
+   forceNow bounce to apply.

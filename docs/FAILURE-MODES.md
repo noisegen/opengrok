@@ -107,28 +107,37 @@ Legend: SYMPTOM (what you see) → CAUSE (what's actually wrong) → LOCK (the f
 - **LOCK:** dedicated profiles/dir copies for automation; never fight the user's live session.
 
 ### F19 — Durable hop bindings, stock host after recover (fleet desync)
-- **SYMPTOM:** after Grok Bot Computer recover / host update, sidebar and
-  `brain-bindings.json` still say DeepSeek (or another hopped brain), but the
-  live host is stock again. Native Grok bots crash or the whole fleet dies when
-  a half-applied overlay `require()`s a missing `brain-router.cjs`, or when hop
-  and host disagree about who owns the session.
-- **CAUSE:** assignments live in `sand-data` (survives recover). The binding
-  consumer (`sand-host/host-main.cjs` hook + `sand-host/brain-router.cjs`) lives
-  in `sand-host` and is rewritten to stock. Recovered hosts may come back as a
-  **Cursor-native-only** bundle (no `createXaiPromptSession` / no
-  `inferenceProvider` branch — session factory is
-  `createCursorInferencePromptSession` only). An xAI-era locator that requires
-  those symbols correctly refuses to half-patch, but without a Cursor-native
-  locator the hop cannot be re-applied and leftover DeepSeek bindings desync.
-- **LOCK:** keep durable copies under `sand-data` (`brain-router.cjs`,
-  `ensure-brain-overlay.py`, `patch-brain-hook.py`). After recover run
-  `python3 ~/sand-data/ensure-brain-overlay.py` (or `doctor.py --fix`). Ensure
-  detects **both** host shapes (grok-bot-setup xAI branch, or recovered
-  Cursor-native wrap of `const session = createCursorInferencePromptSession`),
-  is idempotent, backs up first, verifies fail-closed hook markers, and
-  **restores** `host-main` on any post-write failure. Runtime hop create/key
-  errors fall back to native Grok loudly; unassigned bots never enter the hop.
-  Doctor `brain:desync` FAILs when hop intent exists without a healthy consumer.
+- **SYMPTOM:** after Grok Bot Computer recover / host update / boot-fetch,
+  sidebar and `brain-bindings.json` still say DeepSeek (or another hopped
+  brain), but the live host is stock again. Worse: patching `host-main` then
+  bouncing with supervisor `{kind:"upgrade", mode:"restart", forceNow:true}`
+  has twice taken down the **entire** Grok Bot fleet; John had to click
+  Update Computer to recover — and that boot-fetches stock sand-host,
+  wiping any sand-host-only overlay. Slice-only `node --check` of the wrap
+  hid full-file syntax corruption that crashed node at launch.
+- **CAUSE:** assignments + keys live in `sand-data`/`agent-data` (survive
+  recover). A hop that lives only in `sand-host/host-main.cjs` +
+  `sand-host/brain-router.cjs` is wiped every boot-fetch. Recovered hosts may
+  come back as **Cursor-native-only** (no `createXaiPromptSession` /
+  `inferenceProvider` — wrap site is
+  `const session = createCursorInferencePromptSession(...); return session;`
+  beside `recordPostTurnLabeling`). forceNow bounce while turns are in flight,
+  or a corrupt full host-main, wedges the fleet even when an isolated wrap
+  slice parses.
+- **LOCK:**
+  1. Durable `brain-router.cjs` under `sand-data`/`agent-data`. The host hook
+     loads it via a tiny fail-closed durable-router IIFE (missing/broken →
+     native Grok). sand-host copy is optional last resort only.
+  2. After recover / boot-fetch: run
+     `~/sand-data/host-prestart-ensure.sh` **before** node starts, or
+     `python3 ~/sand-data/ensure-brain-overlay.py` then Quit Grok Bot and
+     reopen. **Never** Update Computer / `./adapters restart-host` / forceNow
+     upgrade to *apply* a hop (Update Computer is recover only).
+  3. Ensure detects both host shapes, is idempotent, backs up first,
+     `node --check`s the **FULL** patched host-main (not a wrap slice), and
+     **restores** on any failure. Unassigned bots never hop; hop/key errors
+     fall back to native. Doctor `brain:desync` FAILs without a healthy
+     durable consumer. Keys stay off git (`deepseek.env`).
 
 ---
 

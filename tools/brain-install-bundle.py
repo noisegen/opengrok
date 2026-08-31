@@ -362,8 +362,9 @@ def main() -> None:
     restore_default_model(os.path.join(args.sand, "settings.json"), args.default_model)
 
     print()
-    print("Installed. One restart only (laptop awake):")
-    print("  cd ~/grok-bot-setup && ./adapters restart-host")
+    print("Installed. Prefer: python3 ~/sand-data/ensure-brain-overlay.py")
+    print("Reload: fully Quit Grok Bot and reopen (loads patched host-main).")
+    print("NEVER ./adapters restart-host / forceNow upgrade / Update Computer to apply.")
     print("Stay on ./adapters use cursor. Never use deepseek or recover.")
     print("Unassigned Bots stay Grok; assigned hop via ~/sand-data/deepseek.env")
     print("Toggle: python3 ~/sand-data/brain-assign.py on|off <UUID>")

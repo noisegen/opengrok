@@ -24,46 +24,73 @@ import shutil
 import sys
 
 HOST = os.path.expanduser("~/sand-host/host-main.cjs")
-ROUTER = os.path.expanduser("~/sand-host/brain-router.cjs")
+# Durable router lives under sand-data/agent-data (survives boot-fetch).
+# sand-host/brain-router.cjs is optional last-resort only.
+ROUTER = os.path.expanduser("~/sand-data/brain-router.cjs")
+
+# Runtime loader: prefer agent-data/sand-data. Never depend on sand-host copy
+# (boot-fetch wipes sand-host). Fail throws into the outer try/catch → native.
+DURABLE_ROUTER_LOAD = r"""(function loadSandBrainRouter() {
+  /* sand-brain durable-router */
+  const fs = require("fs");
+  const path = require("path");
+  const home = process.env.HOME || "/home/box";
+  const candidates = [
+    process.env.BRAIN_ROUTER,
+    process.env.SAND_DATA && path.join(process.env.SAND_DATA, "brain-router.cjs"),
+    path.join(home, "agent-data", "brain-router.cjs"),
+    path.join(home, "sand-data", "brain-router.cjs"),
+    path.join(__dirname, "brain-router.cjs")
+  ].filter(Boolean);
+  let lastErr;
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return require(p);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("sand-brain: brain-router.cjs missing under agent-data/sand-data");
+})()"""
 
 # Shape A — grok-bot-setup (xAI branch present). Inserted in place of the
 # inferenceProvider !== "cursor" block; keeps a fail-closed xAI fallback after.
-NEW_XAI = """try {
+NEW_XAI = f"""try {{
  /* sand-brain pass-through */
- const { createLazyBrainSession } = require("./brain-router.cjs");
- const { createXaiPromptSession } = require("./xai-prompt-session.cjs");
+ const {{ createLazyBrainSession }} = {DURABLE_ROUTER_LOAD};
+ const {{ createXaiPromptSession }} = require("./xai-prompt-session.cjs");
  let cidKey;
  let getCid;
- try { cidKey = conversationIdKey; } catch (e) {}
- try { getCid = getConversationId; } catch (e) {}
- return createLazyBrainSession({
+ try {{ cidKey = conversationIdKey; }} catch (e) {{}}
+ try {{ getCid = getConversationId; }} catch (e) {{}}
+ return createLazyBrainSession({{
   requestedModel,
   onRequestId,
   sessionOptions,
   conversationIdKey: cidKey,
   getConversationId: getCid,
-  nativeFactory: function (so, rid) {
+  nativeFactory: function (so, rid) {{
    const cb = typeof rid === "function" ? rid : onRequestId;
-   if (typeof createCursorInferencePromptSession === "function") {
-    return createCursorInferencePromptSession({ requestedModel, onRequestId: cb, sessionOptions: so });
-   }
+   if (typeof createCursorInferencePromptSession === "function") {{
+    return createCursorInferencePromptSession({{ requestedModel, onRequestId: cb, sessionOptions: so }});
+   }}
    throw new Error("sand-brain: no native factory");
-  }
- });
-} catch (sandErr) {
+  }}
+ }});
+}} catch (sandErr) {{
  console.error("[sand-brain] overlay failed, native:", sandErr);
- if (typeof createCursorInferencePromptSession === "function") {
-  return createCursorInferencePromptSession({ requestedModel, onRequestId, sessionOptions });
- }
-}
-if (inferenceProvider !== "cursor") {
- try {
-  const { createXaiPromptSession } = require("./xai-prompt-session.cjs");
-  return createXaiPromptSession({ requestedModel, onRequestId, sessionOptions });
- } catch (xaiErr) {
+ if (typeof createCursorInferencePromptSession === "function") {{
+  return createCursorInferencePromptSession({{ requestedModel, onRequestId, sessionOptions }});
+ }}
+}}
+if (inferenceProvider !== "cursor") {{
+ try {{
+  const {{ createXaiPromptSession }} = require("./xai-prompt-session.cjs");
+  return createXaiPromptSession({{ requestedModel, onRequestId, sessionOptions }});
+ }} catch (xaiErr) {{
   console.error("[sand-xai] failed to create xAI session, falling back to native:", xaiErr);
- }
-}"""
+ }}
+}}"""
 
 # Alias for older tests / importers that expect NEW.
 NEW = NEW_XAI
@@ -126,6 +153,7 @@ def _is_current_xai(block: str) -> bool:
         return False
     return (
         "sand-brain pass-through" in block
+        and "sand-brain durable-router" in block
         and "createLazyBrainSession" in block
         and "overlay failed, native" in block
         and "createXaiPromptSession" in block
@@ -138,6 +166,7 @@ def _is_current_cursor(block: str) -> bool:
         return False
     return (
         "sand-brain pass-through" in block
+        and "sand-brain durable-router" in block
         and "createLazyBrainSession" in block
         and "overlay failed, native" in block
         and "createCursorInferencePromptSession" in block
@@ -260,10 +289,12 @@ def _build_cursor_overlay(obj_lit: str, indent: str) -> str:
     # Pass every reachable bot id into createLazyBrainSession. conversationIdKey /
     # getConversationId are often OUT OF SCOPE on recovered Cursor-native hosts;
     # options2 + sessionOptions + zero-arg getters are what isolation actually has.
+    # Router loads from agent-data/sand-data (durable); sand-host copy is last resort.
+    load = DURABLE_ROUTER_LOAD
     lines = [
         "try {",
         " /* sand-brain pass-through */",
-        ' const { createLazyBrainSession } = require("./brain-router.cjs");',
+        f" const {{ createLazyBrainSession }} = {load};",
         " let cidKey;",
         " let getCid;",
         " try { cidKey = conversationIdKey; } catch (e) {}",
@@ -451,8 +482,14 @@ def patch(text: str) -> str:
 
 
 def main() -> None:
-    if not os.path.isfile(ROUTER):
-        die("missing " + ROUTER)
+    # ROUTER may live only under sand-data; do not require sand-host copy.
+    sand_router = os.path.expanduser("~/sand-data/brain-router.cjs")
+    agent_router = os.path.expanduser("~/agent-data/brain-router.cjs")
+    if not os.path.isfile(ROUTER) and not os.path.isfile(sand_router) and not os.path.isfile(agent_router):
+        die(
+            "missing durable brain-router.cjs — expected ~/sand-data/brain-router.cjs "
+            "or ~/agent-data/brain-router.cjs (sand-host copy is optional)"
+        )
     if not os.path.isfile(HOST):
         die("missing " + HOST)
     text = open(HOST, encoding="utf-8", errors="surrogateescape").read()
@@ -476,8 +513,17 @@ def main() -> None:
         die("fail-closed native catch still missing")
     if "createCursorInferencePromptSession" not in body:
         die("createCursorInferencePromptSession still missing")
+    if "sand-brain durable-router" not in body:
+        die("durable-router loader still missing")
+    # FULL file syntax check — slice-only checks hid fleet-killing corruption.
+    import subprocess
+
+    r = subprocess.run(["node", "--check", HOST], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"node --check {HOST} failed:\n{r.stderr}")
     print("ok")
-    print("next: fully Quit Grok Bot and reopen. Do not ./adapters restart-host")
+    print("next: fully Quit Grok Bot and reopen.")
+    print("NEVER Update Grok Bot's Computer or forceNow upgrade to apply a hop.")
     print("then: grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8")
     print("want where=none or where=store — or where=stream if id arrives late")
 

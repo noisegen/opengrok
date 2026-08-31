@@ -256,8 +256,8 @@ def _hop_intent(bindings: Path) -> bool:
             return True
     return False
 
-def _overlay_healthy(host_main: Path, router: Path) -> bool:
-    if not host_main.exists() or not router.exists():
+def _overlay_healthy(host_main: Path, sand_router: Path) -> bool:
+    if not host_main.exists() or not sand_router.exists():
         return False
     try:
         txt = host_main.read_text(encoding="utf-8", errors="replace")
@@ -265,6 +265,7 @@ def _overlay_healthy(host_main: Path, router: Path) -> bool:
         return False
     return (
         "sand-brain pass-through" in txt
+        and "sand-brain durable-router" in txt
         and "createLazyBrainSession" in txt
         and "overlay failed, native" in txt
         and "createCursorInferencePromptSession" in txt
@@ -274,27 +275,22 @@ def check_brain_overlay() -> dict:
     """F19 — hop intent in sand-data must match a live fail-closed host consumer."""
     meta: dict = {"hop_intent": False, "healthy": False, "host_present": False}
     host_main = HOST_DIR / "host-main.cjs"
-    router = HOST_DIR / "brain-router.cjs"
+    sand_router = SAND_DATA / "brain-router.cjs"
+    if not sand_router.exists():
+        alt = Path.home() / "agent-data" / "brain-router.cjs"
+        if alt.exists():
+            sand_router = alt
     meta["host_present"] = host_main.exists()
     intent = _hop_intent(BRAIN_BINDINGS)
     meta["hop_intent"] = intent
-    healthy = _overlay_healthy(host_main, router)
+    healthy = _overlay_healthy(host_main, sand_router)
     meta["healthy"] = healthy
 
-    # Half-applied: hook references router but file is gone (fleet-brick risk).
     if host_main.exists():
         try:
             txt = host_main.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
             emit("FAIL", "brain:overlay", f"unreadable host-main: {exc!r}")
-            return meta
-        if "createLazyBrainSession" in txt and not router.exists():
-            emit(
-                "FAIL",
-                "brain:desync",
-                "host hook requires brain-router.cjs but file MISSING "
-                "(stock recover / half-patch) — run ensure-brain-overlay.py",
-            )
             return meta
         if "createLazyBrainSession" in txt and "overlay failed, native" not in txt:
             emit(
@@ -304,9 +300,24 @@ def check_brain_overlay() -> dict:
                 "run ensure-brain-overlay.py",
             )
             return meta
+        if "createLazyBrainSession" in txt and "sand-brain durable-router" not in txt:
+            emit(
+                "FAIL",
+                "brain:desync",
+                "brain hook still loads sand-host-relative router "
+                "(wiped on boot-fetch) — run ensure-brain-overlay.py",
+            )
+            return meta
+        if "createLazyBrainSession" in txt and not sand_router.exists():
+            emit(
+                "FAIL",
+                "brain:desync",
+                "durable brain-router.cjs MISSING under sand-data/agent-data — "
+                "run ensure-brain-overlay.py",
+            )
+            return meta
 
     if intent and not meta["host_present"]:
-        # Not on a box — WARN only (laptop doctor runs without sand-host).
         emit(
             "WARN",
             "brain:overlay",
@@ -320,12 +331,13 @@ def check_brain_overlay() -> dict:
             "FAIL",
             "brain:desync",
             "bindings want a non-Grok brain but host overlay is stock/unhealthy "
-            "— run: python3 tools/ensure-brain-overlay.py (or doctor --fix)",
+            "— run: python3 tools/ensure-brain-overlay.py (or doctor --fix); "
+            "then Quit Grok Bot and reopen — NEVER forceNow bounce",
         )
         return meta
 
     if healthy:
-        emit("PASS", "brain:overlay", "fail-closed consumer installed")
+        emit("PASS", "brain:overlay", "fail-closed durable consumer installed")
     elif not intent:
         emit("PASS", "brain:overlay", "no hop intent (native Grok only)")
     return meta

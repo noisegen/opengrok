@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
-"""ensure-brain-overlay — re-install the brain hop after a Grok Bot host update/recover.
+"""ensure-brain-overlay — fail-closed hop that survives boot-fetch / Update Computer.
 
-THE PRODUCTION INCIDENT: per-Bot assignments live in sand-data (brain-bindings.json)
-and survive Computer recover. sand-host does not — host-main.cjs comes back stock and
-brain-router.cjs is gone. Bindings / sidebar labels still say DeepSeek while the live
-host no longer consumes them. A half-applied overlay (hook require without the router
-file, or a broken hop) can take down every Bot, not just hopped ones.
+PRODUCTION RULES (learned the hard way):
+  - NEVER apply a hop by patching host-main then forceNow/supervisor bounce.
+    That twice took down the whole Grok Bot fleet; John had to Update Computer
+    to recover — and Update Computer boot-fetches a stock sand-host, wiping
+    any sand-host-only overlay.
+  - Overlay living only in sand-host/host-main.cjs is wiped every recover.
+  - brain-router.cjs MUST live under sand-data/agent-data (durable). The tiny
+    host-main hook loads it from there; require failure → native (fail-closed).
+  - Always `node --check` the FULL patched host-main, never a wrap slice.
 
-This tool is the fail-closed re-apply path:
+What this tool does:
+  1. Sync durable files under sand-data (brain-router, patch, ensure, prestart).
+  2. Patch host-main with a tiny fail-closed wrap (idempotent).
+  3. FULL-file node --check; on any failure RESTORES host-main and exits 1.
+  4. Install host-prestart-ensure.sh so AFTER boot-fetch the hop re-applies
+     BEFORE node starts — no crashy bounce required.
+  5. Never touches API keys.
 
-  1. Keep a durable brain-router.cjs (+ this script / patch-brain-hook) under sand-data.
-  2. Copy the router into sand-host (vendor rewrite wipes that tree).
-  3. Re-apply patch-brain-hook.py (idempotent when already healthy).
-  4. Verify hook + router load. On any post-backup failure: restore host-main, exit 1.
-  5. Never touch API keys; never invent a hop when the overlay cannot be proven healthy.
+Apply path (safe):
+  python3 ~/sand-data/ensure-brain-overlay.py
+  # then fully Quit Grok Bot and reopen (loads patched host-main from disk).
+  # OR: wire host-prestart-ensure.sh before node starts host-main after swap.
 
-Run on the box (or with --host-dir/--sand pointed at a fixture):
+NEVER: Update Grok Bot's Computer / ./adapters restart-host / forceNow upgrade
+to "apply" a hop.
 
-    python3 ensure-brain-overlay.py
-    python3 doctor.py --fix          # calls this when desynced
-
-See docs/CLOUD-HOST.md (brain overlay survival) and docs/FAILURE-MODES.md F19.
+See docs/CLOUD-HOST.md and docs/FAILURE-MODES.md F19.
 """
 from __future__ import annotations
 
@@ -34,6 +41,23 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+PRESTART_SH = """#!/usr/bin/env bash
+# Run BEFORE node starts sand-host/host-main.cjs (after boot-fetch swap).
+# Idempotent. Does NOT bounce the host. Does NOT Update Computer.
+set -euo pipefail
+SAND="${SAND_DATA:-${HOME}/sand-data}"
+# agent-data is often a symlink to sand-data on the live box
+if [[ ! -d "$SAND" && -d "${HOME}/agent-data" ]]; then
+  SAND="${HOME}/agent-data"
+fi
+HOST_DIR="${SAND_HOST:-${HOME}/sand-host}"
+TOOLS="${BRAIN_TOOLS:-$SAND}"
+exec python3 "$SAND/ensure-brain-overlay.py" \\
+  --host-dir "$HOST_DIR" \\
+  --sand "$SAND" \\
+  --tools "$TOOLS"
+"""
 
 
 def die(msg: str) -> None:
@@ -60,14 +84,15 @@ def write(path: str, text: str) -> None:
         f.write(text)
 
 
-def node_check(path: str) -> None:
+def node_check(path: str, label: str = "") -> None:
+    """FULL-file syntax check. Slice-only checks hid fleet-killing corruption."""
     r = subprocess.run(["node", "--check", path], capture_output=True, text=True)
     if r.returncode != 0:
-        die(f"node --check {path} failed:\n{r.stderr}")
+        tag = label or path
+        die(f"node --check {tag} failed (FULL file):\n{r.stderr}")
 
 
 def router_loads(path: str) -> None:
-    """Prove brain-router.cjs parses and exports the fail-closed entry points."""
     script = (
         "const m=require(process.argv[1]);"
         "if(typeof m.createLazyBrainSession!=='function')process.exit(2);"
@@ -84,10 +109,12 @@ def router_loads(path: str) -> None:
         die(f"brain-router load failed ({path}):\n{r.stderr or r.stdout}")
 
 
-def overlay_healthy(host_text: str, router_path: str) -> bool:
-    if not os.path.isfile(router_path):
+def overlay_healthy(host_text: str, sand_router: str) -> bool:
+    if not os.path.isfile(sand_router):
         return False
     if "sand-brain pass-through" not in host_text:
+        return False
+    if "sand-brain durable-router" not in host_text:
         return False
     if "createLazyBrainSession" not in host_text:
         return False
@@ -125,17 +152,29 @@ def pick_router_src(sand: str, tools_dir: str) -> str:
         return repo
     die(
         "no durable brain-router.cjs — copy tools/brain-router.cjs to "
-        f"{durable} (or keep it next to this script) before ensure"
+        f"{durable} before ensure"
     )
-    return ""  # unreachable
+    return ""
 
 
 def sync_durable(tools_dir: str, sand: str) -> None:
-    """Keep sand-data copies that survive sand-host rewrite."""
     os.makedirs(sand, exist_ok=True)
-    for name in ("brain-router.cjs", "patch-brain-hook.py", "ensure-brain-overlay.py"):
+    for name in (
+        "brain-router.cjs",
+        "patch-brain-hook.py",
+        "ensure-brain-overlay.py",
+        "host-prestart-ensure.sh",
+    ):
         src = os.path.join(tools_dir, name)
         dest = os.path.join(sand, name)
+        if name == "host-prestart-ensure.sh" and not os.path.isfile(src):
+            write(dest, PRESTART_SH)
+            try:
+                os.chmod(dest, 0o755)
+            except OSError:
+                pass
+            print(f"  durable: {dest}")
+            continue
         if not os.path.isfile(src):
             continue
         if os.path.isfile(dest):
@@ -146,6 +185,11 @@ def sync_durable(tools_dir: str, sand: str) -> None:
                 pass
         if os.path.abspath(src) != os.path.abspath(dest):
             shutil.copy2(src, dest)
+            if name.endswith(".sh"):
+                try:
+                    os.chmod(dest, 0o755)
+                except OSError:
+                    pass
             print(f"  durable: {dest}")
 
 
@@ -157,7 +201,7 @@ def ensure(
     force: bool = False,
 ) -> str:
     host_main = os.path.join(host_dir, "host-main.cjs")
-    router_dest = os.path.join(host_dir, "brain-router.cjs")
+    sand_router = os.path.join(sand, "brain-router.cjs")
     bindings = os.path.join(sand, "brain-bindings.json")
     patch_py = os.path.join(sand, "patch-brain-hook.py")
     if not os.path.isfile(patch_py):
@@ -169,22 +213,25 @@ def ensure(
         die(f"host-main missing: {host_main} — run on the Grok Bot computer after recover")
 
     print("== ensure-brain-overlay ==")
+    print("  apply path: disk patch + Quit/reopen OR prestart — NEVER forceNow bounce")
     sync_durable(tools_dir, sand)
     router_src = pick_router_src(sand, tools_dir)
 
+    # Always keep durable router bytes current under sand-data.
+    if os.path.abspath(router_src) != os.path.abspath(sand_router):
+        shutil.copy2(router_src, sand_router)
+        print(f"  durable router: {sand_router}")
+
     host_text = read(host_main)
-    router_same = False
-    if os.path.isfile(router_dest):
-        router_same = open(router_src, "rb").read() == open(router_dest, "rb").read()
-    healthy = overlay_healthy(host_text, router_dest) and router_same
+    healthy = overlay_healthy(host_text, sand_router)
 
     if healthy and not force:
-        print("  no changes needed (overlay healthy)")
+        print("  no changes needed (overlay healthy; durable-router loader present)")
         if has_hop_intent(bindings):
             print("  bindings: hop intent present; consumer installed")
+        print(f"  prestart: {os.path.join(sand, 'host-prestart-ensure.sh')}")
         return "noop"
 
-    # Load patch module early so dry-run can report detected shape.
     mod = load_patch_mod(patch_py)
     shape = None
     if hasattr(mod, "detect_shape"):
@@ -202,18 +249,20 @@ def ensure(
     if dry_run:
         print("== dry-run ==")
         print(f"  shape:  {shape}")
-        print(f"  host:   {'HEALTHY' if overlay_healthy(host_text, router_dest) else 'NEEDS PATCH'}")
-        print(f"  router: {'in sync' if router_same else 'MISSING/DRIFT'}")
-        print(f"  would copy {router_src} -> {router_dest}")
+        print(f"  host:   {'HEALTHY' if healthy else 'NEEDS PATCH'}")
+        print(f"  router: {sand_router} ({'present' if os.path.isfile(sand_router) else 'MISSING'})")
         print(f"  would run {patch_py}")
+        print("  would node --check FULL host-main (not a wrap slice)")
+        print("  apply path after write: Quit Grok Bot and reopen — NEVER forceNow bounce")
         return "dry-run"
+
+    # Pre-flight: stock host must already parse before we touch it.
+    node_check(host_main, "host-main (pre-patch FULL)")
 
     stamp = time.strftime("%Y%m%dT%H%M%SZ")
     bk_dir = os.path.join(sand, f"brain-overlay-backups-{stamp}")
     os.makedirs(bk_dir, exist_ok=True)
     shutil.copy2(host_main, os.path.join(bk_dir, "host-main.cjs.bak"))
-    if os.path.isfile(router_dest):
-        shutil.copy2(router_dest, os.path.join(bk_dir, "brain-router.cjs.bak"))
     print(f"  backups -> {bk_dir}")
     print(f"  shape: {shape}")
 
@@ -221,19 +270,14 @@ def ensure(
 
     def restore() -> None:
         shutil.copy2(os.path.join(bk_dir, "host-main.cjs.bak"), host_main)
-        bak_r = os.path.join(bk_dir, "brain-router.cjs.bak")
-        if os.path.isfile(bak_r):
-            shutil.copy2(bak_r, router_dest)
         print(f"  RESTORED host-main from {bk_dir}", file=sys.stderr)
 
     try:
-        shutil.copy2(router_src, router_dest)
-        print(f"  [router] {router_dest}")
-        node_check(router_dest)
-        router_loads(router_dest)
+        node_check(sand_router, "sand-data/brain-router.cjs")
+        router_loads(sand_router)
 
         mod.HOST = host_main
-        mod.ROUTER = router_dest
+        mod.ROUTER = sand_router
         before = read(host_main)
         after = mod.patch(before)
         if after != before:
@@ -243,39 +287,50 @@ def ensure(
         else:
             print("  [host]   already patched")
 
-        node_check(host_main)
+        # FULL file — this is the gate that must pass before any reload.
+        node_check(host_main, "host-main (post-patch FULL)")
         body = read(host_main)
-        if not overlay_healthy(body, router_dest):
+        if not overlay_healthy(body, sand_router):
             die("post-check: overlay still unhealthy — upstream drift; refusing half-state")
-        router_loads(router_dest)
+        router_loads(sand_router)
     except SystemExit:
-        if wrote_host or os.path.isfile(router_dest):
+        if wrote_host:
             restore()
         raise
     except Exception as exc:
-        restore()
+        if wrote_host:
+            restore()
         die(f"ensure failed, restored backup: {exc!r}")
 
-    print("DONE. Quit Grok Bot fully and reopen (do not ./adapters restart-host).")
-    print("Hop failure fail-closes to native Grok; unassigned Bots never touch the hop.")
+    prestart = os.path.join(sand, "host-prestart-ensure.sh")
+    print("DONE.")
+    print("  Durable router:", sand_router)
+    print("  Prestart hook: ", prestart)
+    print("  NEXT (safe reload): fully Quit Grok Bot and reopen.")
+    print("  NEVER Update Grok Bot's Computer / forceNow upgrade / adapters restart-host")
+    print("       to apply this patch — those wipe sand-host or crash the fleet.")
+    print("  After an Update Computer *recover*, run ensure (or prestart) again, then Quit/reopen.")
+    print("  Hop failure fail-closes to native; unassigned Bots never enter the hop.")
     return "applied"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Re-install brain hop overlay after host update/recover (fail-closed)."
+        description="Fail-closed brain hop ensure (durable sand-data; no crashy bounce)."
     )
     ap.add_argument("--host-dir", default=os.path.expanduser("~/sand-host"))
     ap.add_argument("--sand", default=os.path.expanduser("~/sand-data"))
-    ap.add_argument(
-        "--tools",
-        default=HERE,
-        help="repo tools/ dir (source of durable overlay files)",
-    )
+    ap.add_argument("--tools", default=HERE, help="repo tools/ dir")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--force", action="store_true", help="re-copy/re-patch even if healthy")
+    ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
-    ensure(args.host_dir, args.sand, args.tools, dry_run=args.dry_run, force=args.force)
+    # Prefer agent-data when it exists and sand-data does not (live box symlink world).
+    sand = args.sand
+    if not os.path.isdir(sand):
+        agent = os.path.expanduser("~/agent-data")
+        if os.path.isdir(agent):
+            sand = agent
+    ensure(args.host_dir, sand, args.tools, dry_run=args.dry_run, force=args.force)
 
 
 if __name__ == "__main__":

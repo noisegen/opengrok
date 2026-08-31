@@ -3,34 +3,46 @@ Per-Bot DeepSeek — stay on cursor
 Default is Grok 4.6. Assigned UUIDs hop to api.deepseek.com using
 ~/sand-data/deepseek.env (DEEPSEEK_API_KEY=...). Unassigned Bots get a
 raw Cursor session (no Proxy). Live id is lazy conv= at create
-(where=store) or where=none.
+(where=store) or where=none — or where=stream when id arrives late.
 
 Do NOT:
   ./adapters use deepseek
   ./adapters recover
   ./adapters restart-host
+  Update Grok Bot's Computer          (that is RECOVER, not apply)
+  supervisor forceNow upgrade bounce  (twice took down the fleet)
   python3 brain-install-bundle.py
+  hand-edit the ~25MB host-main.cjs
 
 Intro dead / out of sync: fully Quit Grok Bot and reopen. Stay on cursor.
-Reset computer last.
+Update Computer only when the host is already dead and you need recover —
+then re-run ensure (or prestart) before node starts.
 
 Attach (Grok already chats; provider is cursor):
 
-  1. Copy from Explorer (DURABLE copies must live under sand-data —
-     sand-host is wiped on Computer recover / host update):
-       tools/brain-router.cjs         -> ~/sand-data/brain-router.cjs
-       tools/brain-router.cjs         -> ~/sand-host/brain-router.cjs
-       tools/patch-brain-hook.py      -> ~/sand-data/patch-brain-hook.py
-       tools/ensure-brain-overlay.py  -> ~/sand-data/ensure-brain-overlay.py
-       tools/brain-assign.py          -> ~/sand-data/brain-assign.py
+  1. Copy from Explorer (DURABLE copies MUST live under sand-data /
+     agent-data — sand-host is wiped on Computer recover / boot-fetch):
+       tools/brain-router.cjs           -> ~/sand-data/brain-router.cjs
+       tools/patch-brain-hook.py        -> ~/sand-data/patch-brain-hook.py
+       tools/ensure-brain-overlay.py    -> ~/sand-data/ensure-brain-overlay.py
+       tools/host-prestart-ensure.sh    -> ~/sand-data/host-prestart-ensure.sh
+       tools/brain-assign.py            -> ~/sand-data/brain-assign.py
+     Optional last-resort only (wiped on recover):
+       tools/brain-router.cjs           -> ~/sand-host/brain-router.cjs
 
   2. printf 'DEEPSEEK_API_KEY=sk-...\n' > ~/sand-data/deepseek.env
      chmod 600 ~/sand-data/deepseek.env
 
   3. python3 ~/sand-data/ensure-brain-overlay.py
-     (or: python3 ~/sand-data/patch-brain-hook.py)
-     Fully Quit Grok Bot, reopen, Create new Bot.
-     Do not restart-host.
+     Ensure:
+       - syncs durable router under sand-data
+       - patches a tiny fail-closed wrap into host-main
+       - node --check's the FULL host-main (not a wrap slice)
+       - restores host-main on any failure
+       - installs host-prestart-ensure.sh
+     Then: fully Quit Grok Bot and reopen (loads patched host-main from disk).
+     OR wire ~/sand-data/host-prestart-ensure.sh before node starts host-main
+     after a boot-fetch swap.
 
   4. grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8
      Want brain=grok and where=none or where=store — or where=stream when
@@ -40,21 +52,27 @@ Attach (Grok already chats; provider is cursor):
   5. After a Bot intros: python3 ~/sand-data/brain-assign.py on <uuid>
      Next createSession with that id hops. Another Bot stays grok.
 
-After Computer recover / host update (stock sand-host again):
+After Computer recover / host update / boot-fetch (stock sand-host again):
 
-  Bindings in ~/sand-data/brain-bindings.json SURVIVE. The host consumer
-  does NOT. Recovered hosts may be Cursor-native only (no xAI branch) —
-  ensure detects that shape and wraps createCursorInferencePromptSession.
+  Bindings in ~/sand-data/brain-bindings.json SURVIVE.
+  Durable brain-router.cjs under sand-data/agent-data SURVIVES.
+  sand-host/host-main.cjs + any sand-host router do NOT.
 
-  Re-apply without hand-editing host-main.cjs:
+  Recovered hosts may be Cursor-native only (no xAI branch) — ensure detects
+  that shape and wraps createCursorInferencePromptSession. The wrap loads
+  brain-router from sand-data/agent-data (fail-closed to native if missing).
 
+  Re-apply WITHOUT hand-editing host-main and WITHOUT forceNow bounce:
+
+    # preferred after boot-fetch: run before node starts
+    ~/sand-data/host-prestart-ensure.sh
+
+    # or manually, then Quit Grok Bot and reopen
     python3 ~/sand-data/ensure-brain-overlay.py
-    # or: python3 ~/sand-data/../tools/doctor.py --fix   (on a clone)
 
   ensure is idempotent (healthy → "no changes needed"), backs up first,
-  and RESTORES host-main on failure (fail closed — never leave a half
-  patch that bricks native Grok bots). Hop create/key errors also fall
-  back to native Grok loudly.
+  FULL-file node --check, and RESTORES host-main on failure. Hop create/key
+  errors also fall back to native Grok loudly. Unassigned bots never hop.
 
 Daily (no restart):
   python3 ~/sand-data/brain-assign.py on|off <UUID>
