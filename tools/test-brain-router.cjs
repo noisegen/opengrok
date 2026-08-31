@@ -33,6 +33,9 @@ const {
   createBrandedSession,
   createDeepseekHopSession,
   loadHopKey,
+  defaultBrainLogPath,
+  logLine,
+  LOG,
 } = require("./brain-router.cjs");
 
 assert.strictEqual(
@@ -632,5 +635,57 @@ const lazyBoom = createLazyBrainSession({
 });
 assert.strictEqual(createdBoom.kind, "native-after-hop-boom");
 assert.strictEqual(typeof lazyBoom.getExecutor, "function");
+
+// Durable hop-fail log defaults (BRAIN_LOG unset → sand-data/hop-fail-logs).
+{
+  const { spawnSync } = require("child_process");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "brain-log-home-"));
+  fs.mkdirSync(path.join(home, "sand-data"));
+  const script = `
+    delete process.env.BRAIN_LOG;
+    process.env.HOME = ${JSON.stringify(home)};
+    process.env.BRAIN_BINDINGS = ${JSON.stringify(bindings)};
+    const m = require(${JSON.stringify(path.join(__dirname, "brain-router.cjs"))});
+    const p = m.defaultBrainLogPath();
+    if (!String(p).includes("sand-data")) process.exit(2);
+    if (!String(p).includes("hop-fail-logs")) process.exit(3);
+    if (!String(p).endsWith("sand-brain.log")) process.exit(4);
+    if (m.LOG !== p) process.exit(5);
+    m.logLine("durable-default-ok");
+    const fs = require("fs");
+    if (!fs.existsSync(p)) process.exit(6);
+    if (!fs.readFileSync(p, "utf8").includes("durable-default-ok")) process.exit(7);
+  `;
+  const r = spawnSync(process.execPath, ["-e", script], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home },
+  });
+  assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+}
+
+// BRAIN_LOG override wins.
+{
+  const { spawnSync } = require("child_process");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "brain-log-ovr-"));
+  fs.mkdirSync(path.join(home, "sand-data"));
+  const custom = path.join(home, "custom-brain.log");
+  const script = `
+    process.env.HOME = ${JSON.stringify(home)};
+    process.env.BRAIN_LOG = ${JSON.stringify(custom)};
+    process.env.BRAIN_BINDINGS = ${JSON.stringify(bindings)};
+    const m = require(${JSON.stringify(path.join(__dirname, "brain-router.cjs"))});
+    if (m.LOG !== ${JSON.stringify(custom)}) process.exit(2);
+    m.logLine("override-ok");
+  `;
+  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+  assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+  assert.ok(fs.readFileSync(custom, "utf8").includes("override-ok"));
+}
+
+// Missing parent dir: logLine must not throw (mkdir best-effort / fail-closed).
+{
+  logLine("no-throw-check");
+  assert.ok(true);
+}
 
 console.log("ok");

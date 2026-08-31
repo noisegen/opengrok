@@ -185,6 +185,8 @@ class InstallSupervisorPrestartTests(unittest.TestCase):
         self.assertIn("existsSync(ensurePy)", block)
         self.assertIn("execFileSync(", block)
         self.assertIn("join(sandRoot", block)
+        self.assertIn("hop-fail-logs", block)
+        self.assertIn("sand-brain.log", block)
         self.assertNotIn("require(", block)
         self.assertNotIn("createRequire", block)
         self.assertNotRegex(block, r"\bconst\s*\{\s*execFileSync\s*\}")
@@ -197,6 +199,47 @@ class InstallSupervisorPrestartTests(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue((self.sand / "install-supervisor-prestart.py").is_file())
+
+    def test_runtime_missing_ensure_appends_durable_hop_fail_log(self):
+        """Missing ensure.py → console + durable sand-data/hop-fail-logs log."""
+        fake_host = self.root / "fake-host2.mjs"
+        marker = self.root / "spawned2.flag"
+        fake_host.write_text(
+            "import { writeFileSync } from 'node:fs';\n"
+            f"writeFileSync({str(marker)!r}, 'ok');\n",
+            encoding="utf-8",
+        )
+        empty_sand = self.root / "empty-sand2"
+        empty_sand.mkdir()
+        self.sup.write_text(
+            make_harness_supervisor(fake_host, empty_sand), encoding="utf-8"
+        )
+        status, out, _ = self._run()
+        self.assertEqual(status, "applied", out)
+        runner = self.root / "run-launch2.mjs"
+        runner.write_text(
+            f"import {{ launchHost }} from {self.sup.as_uri()!r};\n"
+            "const child = launchHost();\n"
+            "await new Promise((r) => child.once('exit', r));\n"
+            "if (child.exitCode !== 0) process.exit(child.exitCode || 1);\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["SAND_DATA_ROOT"] = str(empty_sand)
+        env.pop("BRAIN_LOG", None)
+        proc = subprocess.run(
+            ["node", str(runner)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(marker.is_file())
+        durable = empty_sand / "hop-fail-logs" / "sand-brain.log"
+        self.assertTrue(durable.is_file(), "expected durable hop-fail log")
+        self.assertIn("missing", durable.read_text(encoding="utf-8"))
+        self.assertIn("missing", proc.stderr + proc.stdout)
 
     def test_idempotent_noop(self):
         self._run()

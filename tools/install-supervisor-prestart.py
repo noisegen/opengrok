@@ -82,6 +82,30 @@ PRESTART_BLOCK = r"""%s
       join(process.env.HOME || "/home/box", "sand-data");
     const ensurePy = join(sandRoot, "ensure-brain-overlay.py");
     const hostDir = HOST_DIR || process.env.SAND_HOST || join(process.env.HOME || "/home/box", "sand-host");
+    const appendHopFailLog = (msg) => {
+      try {
+        const logFile =
+          process.env.BRAIN_LOG ||
+          join(sandRoot, "hop-fail-logs", "sand-brain.log");
+        const line =
+          new Date().toISOString() +
+          " [sand-brain] " +
+          String(msg == null ? "" : msg);
+        execFileSync(
+          "/bin/sh",
+          [
+            "-c",
+            'mkdir -p "$(dirname "$1")" && printf "%%s\\n" "$2" >> "$1"',
+            "sh",
+            logFile,
+            line,
+          ],
+          { stdio: "ignore" }
+        );
+      } catch (_) {
+        /* logging must never block spawn */
+      }
+    };
     if (existsSync(ensurePy)) {
       execFileSync(
         process.env.PYTHON || "python3",
@@ -90,12 +114,42 @@ PRESTART_BLOCK = r"""%s
       );
     } else {
       console.error("[sand-brain] supervisor prestart: missing", ensurePy);
+      appendHopFailLog("supervisor prestart: missing " + String(ensurePy));
     }
   } catch (sandPreErr) {
     console.error(
       "[sand-brain] supervisor prestart failed (continuing stock spawn):",
       sandPreErr && sandPreErr.message ? sandPreErr.message : sandPreErr
     );
+    try {
+      const sandRoot2 =
+        process.env.SAND_DATA_ROOT ||
+        process.env.SAND_DATA ||
+        AGENT_DATA_ROOT ||
+        join(process.env.HOME || "/home/box", "sand-data");
+      const logFile =
+        process.env.BRAIN_LOG ||
+        join(sandRoot2, "hop-fail-logs", "sand-brain.log");
+      const line =
+        new Date().toISOString() +
+        " [sand-brain] supervisor prestart failed (continuing stock spawn): " +
+        String(
+          sandPreErr && sandPreErr.message ? sandPreErr.message : sandPreErr
+        );
+      execFileSync(
+        "/bin/sh",
+        [
+          "-c",
+          'mkdir -p "$(dirname "$1")" && printf "%%s\\n" "$2" >> "$1"',
+          "sh",
+          logFile,
+          line,
+        ],
+        { stdio: "ignore" }
+      );
+    } catch (_) {
+      /* logging must never block spawn */
+    }
   }
 """ % MARKER
 

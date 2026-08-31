@@ -13,7 +13,26 @@ const path = require("path");
 const BINDINGS =
   process.env.BRAIN_BINDINGS ||
   path.join(process.env.HOME || "/home/box", "sand-data", "brain-bindings.json");
-const LOG = process.env.BRAIN_LOG || "/tmp/sand-brain.log";
+
+/** Durable hop-fail log — /tmp dies on Update Computer; sand-data survives. */
+function defaultBrainLogPath() {
+  const home = process.env.HOME || "/home/box";
+  const sand = path.join(home, "sand-data", "hop-fail-logs", "sand-brain.log");
+  const agent = path.join(home, "agent-data", "hop-fail-logs", "sand-brain.log");
+  try {
+    if (fs.existsSync(path.join(home, "sand-data"))) return sand;
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (fs.existsSync(path.join(home, "agent-data"))) return agent;
+  } catch {
+    /* ignore */
+  }
+  return "/tmp/sand-brain.log";
+}
+
+const LOG = process.env.BRAIN_LOG || defaultBrainLogPath();
 const UUID_RE =
   /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const ID_KEY_RE =
@@ -60,9 +79,14 @@ const STOCK_PROVIDERS = {
 
 function logLine(msg) {
   try {
+    try {
+      fs.mkdirSync(path.dirname(LOG), { recursive: true });
+    } catch {
+      /* ignore */
+    }
     fs.appendFileSync(LOG, new Date().toISOString() + " " + msg + "\n");
   } catch {
-    /* ignore */
+    /* logging must never throw into hop */
   }
 }
 
@@ -778,4 +802,7 @@ module.exports = {
   loadHopKey,
   STOCK_PROVIDERS,
   LIVE_BRAINS,
+  defaultBrainLogPath,
+  logLine,
+  LOG,
 };
