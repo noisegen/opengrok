@@ -7,12 +7,14 @@ const assert = require("assert");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "brain-router-"));
 const bindings = path.join(tmp, "brain-bindings.json");
 const log = path.join(tmp, "sand-brain.log");
+const XIAN = "3caa4bd8-2a3d-4a61-aed1-d2e78969faea";
 fs.writeFileSync(
   bindings,
   JSON.stringify({
     default: "grok",
     agents: {
       "71b408bd-0c94-494b-8a45-754bc0ef2d73": { brain: "deepseek", name: "Long Run" },
+      [XIAN]: { brain: "deepseek", name: "Xian" },
       "bbbbbbbb-0000-4000-8000-000000000002": { brain: "kimi", name: "Future" },
     },
   })
@@ -179,17 +181,16 @@ const lazy = createLazyBrainSession({
   },
   createHopSession: hopSession(created),
 });
-assert.strictEqual(lazy, nativeRef);
-assert.strictEqual(lazy.getExecutor, nativeRef.getExecutor);
-assert.strictEqual(created.ready, true);
+// Empty cid at wrap → deferred proxy (not eager native forever).
+assert.strictEqual(typeof lazy.getExecutor, "function");
 assert.strictEqual(typeof lazy.getModelId, "function");
 assert.strictEqual(lazy.getModelId(), "mid-native:");
 assert.strictEqual(lazy.extraMethod(), "extra:native:");
 const ex = lazy.getExecutor([{ role: "user", content: "hi" }]);
-assert.strictEqual(require("util").types.isProxy(ex), false);
+// Stream ctx carries the bound id → hop (where=stream).
 const out = ex.stream(new Map([[cidKey, LONG_RUN]]), "inv1", []);
-assert.strictEqual(created.kind, "native:");
-assert.strictEqual(out, "native::inv1");
+assert.strictEqual(created.kind, "hop:" + LONG_RUN);
+assert.strictEqual(out, "hop:" + LONG_RUN + ":inv1");
 
 const createdHopNow = { ready: false, kind: "" };
 const hopNow = createLazyBrainSession({
@@ -267,20 +268,17 @@ const reqOpts = {
   createHopSession: hopSession(createdReq),
 };
 const lazyReq = createLazyBrainSession(reqOpts);
-assert.strictEqual(createdReq.ready, true);
-assert.ok(createdReq.kind.startsWith("native:"));
 assert.strictEqual(typeof lazyReq.getModelId, "function");
 reqOpts.onRequestId(new Map([[cidKey, LONG_RUN]]));
-assert.ok(createdReq.kind.startsWith("native:"));
 const reqOut = lazyReq.getExecutor([]).stream(new Map([[cidKey, LONG_RUN]]), "inv4", []);
-assert.ok(createdReq.kind.startsWith("native:"));
-assert.strictEqual(reqOut, "native::inv4");
+assert.strictEqual(createdReq.kind, "hop:" + LONG_RUN);
+assert.strictEqual(reqOut, "hop:" + LONG_RUN + ":inv4");
 
 const logTxt = fs.readFileSync(log, "utf8");
 assert.ok(logTxt.includes("[sand-brain] lazy conv=" + LONG_RUN));
 assert.ok(logTxt.includes("where=store"));
 assert.ok(logTxt.includes("where=none"));
-assert.ok(!logTxt.includes("where=stream"));
+assert.ok(logTxt.includes("where=stream"));
 assert.ok(!logTxt.includes("where=onRequestId"));
 
 const createdEmpty = { ready: false, kind: "" };
@@ -295,6 +293,48 @@ lazyEmpty.getExecutor([]).stream(new Map(), "inv5", []);
 const logEmpty = fs.readFileSync(log, "utf8");
 assert.ok(logEmpty.includes("where=none"));
 assert.ok(createdEmpty.kind.startsWith("native"));
+
+// Recovered Cursor-native: empty conversationId, agentId = Xian → hop at store.
+const createdXian = { ready: false, kind: "" };
+const xianSess = createLazyBrainSession({
+  sessionOptions: { modelId: "grok-4.6", agentId: XIAN },
+  nativeFactory: () => fakeSession("native", createdXian),
+  createHopSession: hopSession(createdXian),
+});
+assert.strictEqual(createdXian.kind, "hop:" + XIAN);
+assert.strictEqual(xianSess.getModelId(), "mid-hop:" + XIAN);
+const logXian = fs.readFileSync(log, "utf8");
+assert.ok(logXian.includes("brain=deepseek"));
+assert.ok(logXian.includes("where=store"));
+
+// options2.getAgentId() harvest (zero-arg) → hop at store.
+const createdOpts2 = { ready: false, kind: "" };
+const opts2Sess = createLazyBrainSession({
+  sessionOptions: { modelId: "grok-4.6" },
+  options2: {
+    getAccessToken() {
+      return "tok";
+    },
+    getAgentId() {
+      return XIAN;
+    },
+  },
+  nativeFactory: () => fakeSession("native", createdOpts2),
+  createHopSession: hopSession(createdOpts2),
+});
+assert.strictEqual(createdOpts2.kind, "hop:" + XIAN);
+
+// Unassigned agent id → native.
+const createdUn = { ready: false, kind: "" };
+createLazyBrainSession({
+  sessionOptions: {
+    modelId: "grok-4.6",
+    agentId: "aaaaaaaa-0000-4000-8000-000000000001",
+  },
+  nativeFactory: () => fakeSession("native-un", createdUn),
+  createHopSession: hopSession(createdUn),
+});
+assert.strictEqual(createdUn.kind, "native-un");
 
 function ProtoSession(kind, created) {
   created.kind = kind;
@@ -336,7 +376,8 @@ const protoSess = createLazyBrainSession({
 assert.strictEqual(typeof protoSess.getModelId, "function");
 assert.strictEqual(protoSess.getModelId(), "proto-native-proto");
 assert.strictEqual(protoSess.mystery(), "mystery:native-proto");
-assert.strictEqual(protoSess.getExecutor, ProtoSession.prototype.getExecutor);
+assert.strictEqual(typeof protoSess.getExecutor, "function");
+// Deferred hop wraps getExecutor; prototype method remains reachable via native until hop.
 
 const holdBoom = {};
 Object.defineProperty(holdBoom, "id", {

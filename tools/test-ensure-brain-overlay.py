@@ -458,6 +458,8 @@ class CursorNativePatchTests(unittest.TestCase):
         self.assertIn("overlay failed, native", host)
         self.assertIn("nativeFactory", host)
         self.assertIn("getAccessToken: options2.getAccessToken", host)
+        self.assertIn("pickSandBrainIds", host)
+        self.assertIn("options2:", host)
         # Fail-closed stock path preserved inside catch.
         self.assertIn("createCursorInferencePromptSession", host)
         self.assertNotIn("createXaiPromptSession", host)
@@ -496,6 +498,47 @@ class CursorNativePatchTests(unittest.TestCase):
         self.assertEqual(status, "dry-run")
         self.assertIn("cursor-native", out)
         self.assertFalse((self.host_dir / "brain-router.cjs").exists())
+
+    def test_cursor_native_upgrades_stale_overlay_without_id_bag(self):
+        # Simulate the live wrap that was applied before pickSandBrainIds existed.
+        stale = (
+            "// recovered\n"
+            "function createCursorInferencePromptSession(opts) { return opts; }\n"
+            "function createSession(options2, sessionOptions, onRequestId) {\n"
+            "      const requestedModel = 'grok-4.6';\n"
+            "      try {\n"
+            "       /* sand-brain pass-through */\n"
+            '       const { createLazyBrainSession } = require("./brain-router.cjs");\n'
+            "       let cidKey; let getCid;\n"
+            "       try { cidKey = conversationIdKey; } catch (e) {}\n"
+            "       try { getCid = getConversationId; } catch (e) {}\n"
+            "       return createLazyBrainSession({\n"
+            "        requestedModel, onRequestId, sessionOptions,\n"
+            "        conversationIdKey: cidKey, getConversationId: getCid,\n"
+            "        nativeFactory: function (so, rid) {\n"
+            '         const cb = typeof rid === "function" ? rid : onRequestId;\n'
+            "         return createCursorInferencePromptSession({\n"
+            "          getAccessToken: options2.getAccessToken,\n"
+            "          requestedModel,\n"
+            "          onRequestId: cb\n"
+            "         });\n"
+            "        }\n"
+            "       });\n"
+            "      } catch (sandErr) {\n"
+            '       console.error("[sand-brain] overlay failed, native:", sandErr);\n'
+            "       const session = createCursorInferencePromptSession({\n"
+            "        getAccessToken: options2.getAccessToken,\n"
+            "        requestedModel,\n"
+            "        onRequestId\n"
+            "       });\n"
+            "       return session;\n"
+            "      }\n"
+            "}\n"
+        )
+        out = self.pbh.patch(stale)
+        self.assertIn("pickSandBrainIds", out)
+        self.assertIn("options2:", out)
+        self.assertEqual(out, self.pbh.patch(out))
 
     def test_patch_prefers_xai_when_both_present(self):
         # xAI shape also contains a createCursorInferencePromptSession call;

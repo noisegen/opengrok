@@ -87,11 +87,28 @@ function collect(obj, out, depth) {
     return;
   }
   if (typeof obj !== "object") return;
-  for (const [k, v] of Object.entries(obj)) {
-    if (ID_KEY_RE.test(k) && typeof v === "string" && v.trim()) {
-      out.add(v.trim().toLowerCase());
+  let entries;
+  try {
+    entries = Object.entries(obj);
+  } catch {
+    return;
+  }
+  for (const [k, v] of entries) {
+    try {
+      if (ID_KEY_RE.test(k) && typeof v === "string" && v.trim()) {
+        out.add(v.trim().toLowerCase());
+      } else if (ID_KEY_RE.test(k) && typeof v === "function" && v.length === 0) {
+        try {
+          const got = v.call(obj);
+          if (typeof got === "string" && got.trim()) out.add(got.trim().toLowerCase());
+        } catch {
+          /* ignore */
+        }
+      }
+      if (typeof v !== "function") collect(v, out, depth + 1);
+    } catch {
+      /* ignore hostile getters */
     }
-    collect(v, out, depth + 1);
   }
 }
 
@@ -100,6 +117,50 @@ function candidateIds(sessionOptions, requestedModel) {
   collect(sessionOptions, out, 0);
   collect(requestedModel, out, 0);
   return [...out];
+}
+
+/** Merge wrap-time identity from sessionOptions + options2 + hints for resolveBrain. */
+function buildIdentityBag(opts) {
+  const bag = Object.assign({}, (opts && opts.sessionOptions) || {});
+  const extras = [opts && opts.options2, opts && opts.identityBag, opts && opts.context];
+  for (const src of extras) {
+    if (!src || typeof src !== "object") continue;
+    for (const key of [
+      "agentId",
+      "agent_id",
+      "conversationId",
+      "conversation_id",
+      "bcId",
+      "bc_id",
+      "botId",
+      "bot_id",
+      "provenanceAgentId",
+    ]) {
+      if (bag[key]) continue;
+      try {
+        const v = src[key];
+        if (typeof v === "string" && v.trim()) bag[key] = v.trim();
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const g of ["getAgentId", "getBotId", "getConversationId", "getBcId", "getAgentBCId"]) {
+      try {
+        if (typeof src[g] !== "function" || src[g].length !== 0) continue;
+        const got = src[g]();
+        if (typeof got !== "string" || !got.trim()) continue;
+        const s = got.trim();
+        if (!bag.agentId && /agent/i.test(g)) bag.agentId = s;
+        else if (!bag.conversationId && /conversation/i.test(g)) bag.conversationId = s;
+        else if (!bag.bcId && /bc/i.test(g)) bag.bcId = s;
+        else if (!bag.botId && /bot/i.test(g)) bag.botId = s;
+        else if (!bag.agentId) bag.agentId = s;
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return bag;
 }
 
 function agentEntry(agents, id) {
@@ -120,13 +181,19 @@ function providerOf(data, brainId) {
   return Object.assign({ id }, stock, fromFile);
 }
 
-function resolveBrain(sessionOptions, requestedModel) {
+function resolveBrain(sessionOptions, requestedModel, moreSources) {
   const opts = sessionOptions || {};
   if (opts.isSummarizationSession === true) {
     logLine("summarization -> grok");
     return providerOf({}, "grok");
   }
-  const ids = candidateIds(opts, requestedModel);
+  const idSet = new Set(candidateIds(opts, requestedModel));
+  if (Array.isArray(moreSources)) {
+    for (const src of moreSources) collect(src, idSet, 0);
+  } else if (moreSources) {
+    collect(moreSources, idSet, 0);
+  }
+  const ids = [...idSet];
   const keys =
     opts && typeof opts === "object" && !Array.isArray(opts)
       ? Object.keys(opts)
@@ -548,20 +615,119 @@ function readOptsId(opts) {
   );
 }
 
-function buildLazyBrainSession(opts) {
-  const origOnRequestId = opts.onRequestId;
-  const wrapId = readOptsId(opts);
-  if (wrapId) {
-    const so = Object.assign({}, opts.sessionOptions || {}, { conversationId: wrapId });
-    const brain = resolveBrain(so, opts.requestedModel);
-    brainLog(wrapId, (brain && brain.id) || "grok", "store");
-    if (brain && brain.kind !== "native") {
-      return materializeSession(opts, wrapId);
+function resolveFromOpts(opts, so, more) {
+  const bag = so || buildIdentityBag(opts);
+  const extras = [opts && opts.options2, opts && opts.identityBag, more].filter(Boolean);
+  return resolveBrain(bag, opts.requestedModel, extras);
+}
+
+/**
+ * When wrap-time identity is empty, do NOT eagerly native forever.
+ * Re-resolve at getExecutor / stream (where=stream) once ctx/sessionOptions carry an id.
+ */
+function createDeferredHopSession(opts) {
+  const native = openNative(opts, opts.onRequestId);
+  let hopped = null;
+
+  function tryHop(where, argsLike, ctx) {
+    if (hopped) return hopped;
+    const bag = buildIdentityBag(opts);
+    const fromArgs = idFromCallArgs(opts, argsLike);
+    const fromCtx = ctx != null ? fromStore(ctx, opts.conversationIdKey, opts.getConversationId) : "";
+    const wrapId = readOptsId(opts);
+    const id = fromArgs || fromCtx || wrapId || bag.conversationId || bag.agentId || bag.bcId || bag.botId || "";
+    if (id) {
+      if (!bag.conversationId) bag.conversationId = id;
+      if (
+        !bag.agentId &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+      ) {
+        bag.agentId = id;
+      }
     }
-  } else {
-    brainLog("", "grok", "none");
+    const brain = resolveFromOpts(
+      Object.assign({}, opts, { sessionOptions: bag }),
+      bag,
+      ctx
+    );
+    const label = id || (brain && brain.agentId) || "";
+    brainLog(label, (brain && brain.id) || "grok", where);
+    if (brain && brain.kind !== "native") {
+      hopped = materializeSession(
+        Object.assign({}, opts, { sessionOptions: bag }),
+        label || brain.agentId
+      );
+      return hopped;
+    }
+    return null;
   }
-  return openNative(opts, origOnRequestId);
+
+  return proxyObject(native, {
+    getExecutor: function (initialMessages) {
+      try {
+        const hop = tryHop("executor", [], null);
+        if (hop && typeof hop.getExecutor === "function") {
+          return hop.getExecutor(initialMessages);
+        }
+      } catch (err) {
+        logLine("executor hop failed, native: " + ((err && err.message) || err));
+      }
+      const ex = native.getExecutor.apply(native, arguments);
+      if (!ex || typeof ex !== "object") return ex;
+      const origStream = typeof ex.stream === "function" ? ex.stream.bind(ex) : null;
+      return proxyObject(ex, {
+        stream: function (ctx) {
+          try {
+            const hop = tryHop("stream", arguments, ctx);
+            if (hop && typeof hop.getExecutor === "function") {
+              const seed = snapshotMessages(ex, initialMessages);
+              const hex = hop.getExecutor(seed);
+              if (hex && typeof hex.stream === "function") {
+                return hex.stream.apply(hex, arguments);
+              }
+            }
+          } catch (err) {
+            logLine("stream hop failed, native: " + ((err && err.message) || err));
+          }
+          if (!origStream) throw new Error("sand-brain: no stream");
+          return origStream.apply(null, arguments);
+        },
+      });
+    },
+  });
+}
+
+function buildLazyBrainSession(opts) {
+  opts = opts || {};
+  const origOnRequestId = opts.onRequestId;
+  const bag = buildIdentityBag(opts);
+  opts = Object.assign({}, opts, { sessionOptions: bag });
+
+  const wrapId = readOptsId(opts);
+  const brain = resolveFromOpts(opts, bag);
+  const earlyId =
+    wrapId ||
+    bag.conversationId ||
+    bag.agentId ||
+    bag.bcId ||
+    bag.botId ||
+    (brain && brain.agentId) ||
+    "";
+
+  if (earlyId) {
+    const so = Object.assign({}, bag, wrapId ? { conversationId: wrapId } : {});
+    // Re-resolve with conversationId filled when wrapId came from ALS/store.
+    const brain2 = resolveFromOpts(Object.assign({}, opts, { sessionOptions: so }), so);
+    brainLog(earlyId, (brain2 && brain2.id) || "grok", "store");
+    if (brain2 && brain2.kind !== "native") {
+      return materializeSession(Object.assign({}, opts, { sessionOptions: so }), earlyId);
+    }
+    return openNative(Object.assign({}, opts, { sessionOptions: so }), origOnRequestId);
+  }
+
+  // No bot identity at wrap — log and defer. Empty cid must not nail native forever.
+  brainLog("", "grok", "none");
+  return createDeferredHopSession(opts);
 }
 
 function createLazyBrainSession(opts) {
@@ -601,6 +767,7 @@ module.exports = {
   shouldUseDeepseek,
   resolveBrain,
   candidateIds,
+  buildIdentityBag,
   identityText,
   injectIdentity,
   readConversationId,

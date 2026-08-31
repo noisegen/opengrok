@@ -142,6 +142,8 @@ def _is_current_cursor(block: str) -> bool:
         and "overlay failed, native" in block
         and "createCursorInferencePromptSession" in block
         and "nativeFactory" in block
+        and "pickSandBrainIds" in block
+        and "options2:" in block
     )
 
 
@@ -224,13 +226,20 @@ def _native_factory_args(obj_lit: str) -> str:
 
     Shadows sessionOptions = so so lineage/inferenceReason pick up the lazy so.
     """
-    # Shorthand `onRequestId,` or `onRequestId\n` → `onRequestId: cb,`
+    # Shorthand `onRequestId,` or bare `onRequestId` before closing brace
     out = re.sub(
         r"(\n\s*)onRequestId(\s*,)",
         r"\1onRequestId: cb\2",
         obj_lit,
         count=1,
     )
+    if out == obj_lit:
+        out = re.sub(
+            r"(\n\s*)onRequestId(\s*\n\s*\})",
+            r"\1onRequestId: cb\2",
+            obj_lit,
+            count=1,
+        )
     if out == obj_lit:
         # Already `onRequestId: something` — force cb
         out2 = re.sub(
@@ -248,6 +257,9 @@ def _native_factory_args(obj_lit: str) -> str:
 def _build_cursor_overlay(obj_lit: str, indent: str) -> str:
     factory_args = _native_factory_args(obj_lit)
     # Keep indentation of the surrounding block (production uses 6 spaces).
+    # Pass every reachable bot id into createLazyBrainSession. conversationIdKey /
+    # getConversationId are often OUT OF SCOPE on recovered Cursor-native hosts;
+    # options2 + sessionOptions + zero-arg getters are what isolation actually has.
     lines = [
         "try {",
         " /* sand-brain pass-through */",
@@ -256,12 +268,46 @@ def _build_cursor_overlay(obj_lit: str, indent: str) -> str:
         " let getCid;",
         " try { cidKey = conversationIdKey; } catch (e) {}",
         " try { getCid = getConversationId; } catch (e) {}",
+        " const __sandBag = (function pickSandBrainIds() {",
+        "  const bag = {};",
+        "  const srcs = [];",
+        '  try { if (typeof sessionOptions !== "undefined" && sessionOptions) srcs.push(sessionOptions); } catch (e) {}',
+        '  try { if (typeof options2 !== "undefined" && options2) srcs.push(options2); } catch (e) {}',
+        "  for (const src of srcs) {",
+        "   if (!src || typeof src !== \"object\") continue;",
+        '   for (const k of ["agentId","agent_id","conversationId","conversation_id","bcId","bc_id","botId","bot_id","provenanceAgentId"]) {',
+        "    try { if (!bag[k] && typeof src[k] === \"string\" && src[k]) bag[k] = src[k]; } catch (e) {}",
+        "   }",
+        '   for (const g of ["getAgentId","getBotId","getConversationId","getBcId","getAgentBCId"]) {',
+        "    try {",
+        "     if (typeof src[g] === \"function\" && src[g].length === 0) {",
+        "      const v = src[g]();",
+        '      if (typeof v === "string" && v) {',
+        '       if (!bag.agentId && /agent/i.test(g)) bag.agentId = v;',
+        '       else if (!bag.conversationId && /conversation/i.test(g)) bag.conversationId = v;',
+        '       else if (!bag.bcId && /bc/i.test(g)) bag.bcId = v;',
+        '       else if (!bag.botId && /bot/i.test(g)) bag.botId = v;',
+        "       else if (!bag.agentId) bag.agentId = v;",
+        "      }",
+        "     }",
+        "    } catch (e) {}",
+        "   }",
+        "  }",
+        "  return bag;",
+        " })();",
         " return createLazyBrainSession({",
         "  requestedModel,",
         "  onRequestId,",
-        "  sessionOptions,",
+        "  sessionOptions: Object.assign({}, typeof sessionOptions !== \"undefined\" && sessionOptions ? sessionOptions : {}, __sandBag),",
+        '  options2: typeof options2 !== "undefined" ? options2 : void 0,',
         "  conversationIdKey: cidKey,",
         "  getConversationId: getCid,",
+        "  getBotId: function (ctx) {",
+        "   try { if (typeof options2 !== \"undefined\" && options2 && typeof options2.getAgentId === \"function\") { const v = options2.getAgentId(ctx); if (v) return String(v); } } catch (e) {}",
+        "   try { if (typeof options2 !== \"undefined\" && options2 && typeof options2.getBotId === \"function\") { const v = options2.getBotId(ctx); if (v) return String(v); } } catch (e) {}",
+        "   try { if (__sandBag.agentId) return __sandBag.agentId; } catch (e) {}",
+        '   return "";',
+        "  },",
         "  nativeFactory: function (so, rid) {",
         '   const cb = typeof rid === "function" ? rid : onRequestId;',
         "   const sessionOptions = so;",
@@ -406,7 +452,7 @@ def main() -> None:
     print("ok")
     print("next: fully Quit Grok Bot and reopen. Do not ./adapters restart-host")
     print("then: grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8")
-    print("want where=none or where=store — not where=stream")
+    print("want where=none or where=store — or where=stream if id arrives late")
 
 
 if __name__ == "__main__":

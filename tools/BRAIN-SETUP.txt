@@ -33,7 +33,8 @@ Attach (Grok already chats; provider is cursor):
      Do not restart-host.
 
   4. grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8
-     Want brain=grok and where=none or where=store — not where=stream.
+     Want brain=grok and where=none or where=store — or where=stream when
+     the bot id arrives only at getExecutor/stream (recovered Cursor-native).
      Dashboard must not move.
 
   5. After a Bot intros: python3 ~/sand-data/brain-assign.py on <uuid>

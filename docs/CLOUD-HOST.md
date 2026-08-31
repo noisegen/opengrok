@@ -152,7 +152,13 @@ python3 tools/doctor.py --fix
 | Shape | How we know | Wrap site |
 |---|---|---|
 | grok-bot-setup | `createXaiPromptSession` + `inferenceProvider !== "cursor"` | replace that if-block |
-| recovered Cursor-native (e.g. host version `112ba04`) | no xAI branch; `const session = createCursorInferencePromptSession({...}); return session;` | wrap that call/return; `nativeFactory` is the same invocation |
+| recovered Cursor-native (e.g. host version `112ba04`) | no xAI branch; `const session = createCursorInferencePromptSession({...}); return session;` | wrap that call/return; `nativeFactory` is the same invocation; harvest `options2` / `sessionOptions` agent ids via `pickSandBrainIds` |
+
+If conversation id is empty at `createSession` (common on recovered hosts —
+`conversationIdKey` / `getConversationId` are out of scope), the router **defers**
+until `getExecutor` / `stream` (`where=stream`) instead of eagerly nailing native
+Grok. Bindings are keyed by **agent id** (Xian/Mei/Ted/Long Run); `resolveBrain`
+matches those UUIDs from `sessionOptions.agentId` / `options2.getAgentId()` / stream ctx.
 
 Fail-closed rules:
 
