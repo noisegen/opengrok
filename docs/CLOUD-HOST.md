@@ -151,11 +151,23 @@ disk is live only after a host process **start** that already has the wrap.
 ### Disk patch + load wire
 
 ```bash
-python3 ~/sand-data/ensure-brain-overlay.py              # wrap host-main on disk
-python3 ~/sand-data/install-supervisor-prestart.py       # patch launchHost → ensure before spawn
+python3 /home/box/sand-data/ensure-brain-overlay.py              # wrap host-main on disk
+python3 /home/box/sand-data/install-supervisor-prestart.py \
+  --sand /home/box/sand-data --tools /home/box/sand-data          # patch launchHost (sudo -n)
 # wrap goes live on the NEXT host process start through patched launchHost
 # NEVER forceNow / adapters restart-host / Update Computer to apply
 ```
+
+`install-supervisor-prestart.py` notes (live box):
+
+- `sand-supervisor.mjs` is `-rw-r--r-- root root` under `/usr/local/bin` — `box`
+  cannot write it or create a sibling `.bak` there. Backups go under
+  `--sand/brain-overlay-backups-*`.
+- When the file is not writable, the installer re-execs via `sudo -n` with
+  **absolute** `--sand` / `--tools` (sudo sets `HOME=/root`, so `~/sand-data`
+  would wrongly become `/root/sand-data`).
+- If passwordless sudo is unavailable, it dies with that permission fact —
+  never half-patches.
 
 - **Boot-fetch** with supervisor patch kept: launchHost re-runs ensure before
   spawn → wrap can return automatically.
