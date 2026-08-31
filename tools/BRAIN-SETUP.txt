@@ -42,7 +42,10 @@ Attach (Grok already chats; provider is cursor):
        python3 ~/sand-data/ensure-brain-overlay.py
 
   4. Wire supervisor so the NEXT launchHost re-applies before spawn
-     (fail-closed: ensure error still spawns stock Grok):
+     (fail-closed: ensure error still spawns stock Grok).
+     Live sand-supervisor.mjs is ESM — installer reuses module-level
+     execFileSync / existsSync / join (no require). Repo ESM fixture tests
+     must be green before using this on a box:
        python3 ~/sand-data/install-supervisor-prestart.py
      Patches /usr/local/bin/sand-supervisor.mjs launchHost only.
      Does not bounce. Does not Update Computer.

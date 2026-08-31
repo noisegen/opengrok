@@ -16,8 +16,12 @@ LIVE FACTS (Grok Bot computer, verified):
   - Update Computer resets supervisor from the image → this patch is wiped.
 
 What this does:
-  Insert a fail-closed ensure call immediately before that spawn. If ensure
-  fails, spawn still proceeds (stock Grok lives). Idempotent marker:
+  Insert a fail-closed ensure call immediately before that spawn, using the
+  supervisor's existing ESM bindings (execFileSync, existsSync, join,
+  HOST_DIR, AGENT_DATA_ROOT). Never require() / createRequire — live
+  supervisor is ESM and require would ReferenceError inside the try/catch,
+  silently no-oping the hop while stock spawn continues. If ensure fails,
+  spawn still proceeds (stock Grok lives). Idempotent marker:
   /* sand-brain supervisor-prestart */
 
 Boot-fetch (sand-host swap only, supervisor binary kept):
@@ -49,25 +53,27 @@ DEFAULT_SUPERVISOR = "/usr/local/bin/sand-supervisor.mjs"
 MARKER = "/* sand-brain supervisor-prestart */"
 
 # Inserted immediately before the HOST_ENTRY spawn inside launchHost.
+# LIVE supervisor is ESM — top of file already has:
+#   import { execFileSync, spawn } from "node:child_process";
+#   import { existsSync, ... } from "node:fs";
+#   import { join } from "node:path";
+# plus HOST_DIR / AGENT_DATA_ROOT in scope. Do NOT require() / createRequire /
+# shadow those bindings — require is ReferenceError in ESM and the catch would
+# silently no-op the hop while still spawning stock Grok.
 # Fail-closed: any ensure error is logged; spawn still runs.
 PRESTART_BLOCK = r"""%s
   try {
-    const { execFileSync } = require("child_process");
-    const fs = require("fs");
-    const path = require("path");
     const sandRoot =
       process.env.SAND_DATA_ROOT ||
       process.env.SAND_DATA ||
-      path.join(process.env.HOME || "/home/box", "sand-data");
-    const ensurePy = path.join(sandRoot, "ensure-brain-overlay.py");
-    const hostDir =
-      typeof HOST_DIR !== "undefined"
-        ? HOST_DIR
-        : process.env.SAND_HOST || path.join(process.env.HOME || "/home/box", "sand-host");
-    if (fs.existsSync(ensurePy)) {
+      AGENT_DATA_ROOT ||
+      join(process.env.HOME || "/home/box", "sand-data");
+    const ensurePy = join(sandRoot, "ensure-brain-overlay.py");
+    const hostDir = HOST_DIR || process.env.SAND_HOST || join(process.env.HOME || "/home/box", "sand-host");
+    if (existsSync(ensurePy)) {
       execFileSync(
         process.env.PYTHON || "python3",
-        ["--", ensurePy, "--host-dir", String(hostDir), "--sand", String(sandRoot), "--tools", String(sandRoot)],
+        [ensurePy, "--host-dir", String(hostDir), "--sand", String(sandRoot), "--tools", String(sandRoot)],
         { timeout: 180000, stdio: ["ignore", "inherit", "inherit"], env: process.env }
       );
     } else {
@@ -103,6 +109,44 @@ def node_check(path: str) -> None:
         die(f"node --check {path} failed:\n{r.stderr}")
 
 
+def assert_esm_supervisor_bindings(text: str) -> None:
+    """Live sand-supervisor.mjs is ESM; prestart must reuse its imports."""
+    head = text[:4000]
+    if "require(" in head and not re.search(r"^\s*import\s+", head, re.M):
+        die(
+            "supervisor looks like CJS (require without import) — live box is ESM; "
+            "refusing to insert a require()-based prestart"
+        )
+    if not re.search(
+        r"import\s*\{[^}]*\bexecFileSync\b[^}]*\}\s*from\s*[\"']node:child_process[\"']",
+        text,
+    ):
+        die(
+            "supervisor missing ESM `import { execFileSync, … } from \"node:child_process\"` "
+            "— refusing to half-patch"
+        )
+    if not re.search(
+        r"import\s*\{[^}]*\bexistsSync\b[^}]*\}\s*from\s*[\"']node:fs[\"']",
+        text,
+    ):
+        die(
+            "supervisor missing ESM `import { existsSync, … } from \"node:fs\"` "
+            "— refusing to half-patch"
+        )
+    if not re.search(
+        r"import\s*\{[^}]*\bjoin\b[^}]*\}\s*from\s*[\"']node:path[\"']",
+        text,
+    ):
+        die(
+            "supervisor missing ESM `import { join } from \"node:path\"` "
+            "— refusing to half-patch"
+        )
+    if not re.search(r"\bHOST_DIR\b", text):
+        die("supervisor missing HOST_DIR binding — refusing to half-patch")
+    if not re.search(r"\bAGENT_DATA_ROOT\b", text):
+        die("supervisor missing AGENT_DATA_ROOT binding — refusing to half-patch")
+
+
 def find_launch_spawn(text: str) -> re.Match | None:
     """Locate spawn(process.execPath, [HOST_ENTRY], …) used by launchHost."""
     patterns = [
@@ -129,17 +173,61 @@ def find_launch_spawn(text: str) -> re.Match | None:
     ordered = sorted(by_start.values(), key=lambda m: m.start())
     if len(ordered) != 1:
         # Ambiguous — refuse rather than half-patch.
-        return None if len(ordered) > 1 else ordered[0]
+        return None
     return ordered[0]
 
 
 def already_installed(text: str) -> bool:
-    return MARKER in text and "ensure-brain-overlay.py" in text
+    if MARKER not in text or "ensure-brain-overlay.py" not in text:
+        return False
+    # Stale CJS installer left require() — treat as not current.
+    m = find_launch_spawn(text)
+    if m is None:
+        return False
+    marker_at = text.find(MARKER)
+    if marker_at < 0 or marker_at > m.start():
+        return False
+    block = text[marker_at : m.start()]
+    if "require(" in block:
+        return False
+    if "existsSync(ensurePy)" not in block:
+        return False
+    if "execFileSync(" not in block:
+        return False
+    return True
+
+
+def prestart_block_ok(text: str) -> None:
+    """Post-write gate: inserted region must be ESM-safe (no require)."""
+    if MARKER not in text:
+        die("post-check: prestart marker missing")
+    m = find_launch_spawn(text)
+    if m is None:
+        die("post-check: HOST_ENTRY spawn missing after write")
+    marker_at = text.find(MARKER)
+    if marker_at < 0 or marker_at > m.start():
+        die("post-check: prestart marker not before HOST_ENTRY spawn")
+    block = text[marker_at : m.start()]
+    if "require(" in block:
+        die(
+            "post-check: prestart block contains require() — "
+            "live supervisor is ESM; that would ReferenceError and no-op the hop"
+        )
+    if "createRequire" in block:
+        die("post-check: prestart must not use createRequire")
+    if "existsSync(ensurePy)" not in block or "execFileSync(" not in block:
+        die("post-check: prestart missing existsSync/execFileSync use")
+    # Must not shadow module-level execFileSync with a local const binding.
+    if re.search(r"\bconst\s*\{\s*execFileSync\s*\}", block) or re.search(
+        r"\bconst\s+execFileSync\b", block
+    ):
+        die("post-check: prestart must not shadow module-level execFileSync")
 
 
 def patch_text(text: str) -> str:
     if already_installed(text):
         return text
+    assert_esm_supervisor_bindings(text)
     m = find_launch_spawn(text)
     if m is None:
         if "HOST_ENTRY" in text and "spawn(" in text:
@@ -151,20 +239,31 @@ def patch_text(text: str) -> str:
             "could not find launchHost spawn(process.execPath, [HOST_ENTRY], …) — "
             "stock supervisor may have drifted; refusing to half-patch"
         )
+
+    # Stale CJS prestart (require inside marker→spawn): replace that span.
+    insert_at = None
+    marker_at = text.find(MARKER)
+    if marker_at >= 0 and marker_at < m.start():
+        insert_at = marker_at
+        # Expand to start of that line.
+        insert_at = text.rfind("\n", 0, marker_at) + 1
+    else:
+        insert_at = text.rfind("\n", 0, m.start()) + 1
+
     # Insert a full statement block on its own lines immediately BEFORE the
-    # spawn line. Indent = leading whitespace only (not "const child = ").
-    line_start = text.rfind("\n", 0, m.start()) + 1
-    ws_end = line_start
+    # spawn line (or replacing a stale prestart spanning insert_at→spawn).
+    line_start_spawn = text.rfind("\n", 0, m.start()) + 1
+    ws_end = line_start_spawn
     while ws_end < m.start() and text[ws_end] in " \t":
         ws_end += 1
-    indent = text[line_start:ws_end]
+    indent = text[line_start_spawn:ws_end]
     block_lines = PRESTART_BLOCK.splitlines(True)
     indented = "".join(
         (indent + ln) if ln.strip() else ln for ln in block_lines
     )
     if not indented.endswith("\n"):
         indented += "\n"
-    return text[:line_start] + indented + text[line_start:]
+    return text[:insert_at] + indented + text[line_start_spawn:]
 
 
 def sync_installer_to_sand(sand: str, tools_dir: str) -> None:
@@ -209,7 +308,7 @@ def install(
 
     print("== install-supervisor-prestart ==")
     print("  target:", supervisor)
-    print("  note: stock supervisor has NO sand-data prestart hook; this patches launchHost")
+    print("  note: live supervisor is ESM — prestart reuses execFileSync/existsSync/join")
     print("  fail-closed: ensure error → still spawn stock host-main")
     print("  Update Computer resets this file from the image — re-run after recover")
 
@@ -217,16 +316,24 @@ def install(
     text = read(supervisor)
 
     if already_installed(text):
-        print("  already installed (marker present)")
+        print("  already installed (ESM prestart marker present)")
         node_check(supervisor)
+        prestart_block_ok(text)
         return "noop"
 
     if dry_run:
+        try:
+            assert_esm_supervisor_bindings(text)
+            bindings = "ESM ok"
+        except SystemExit as exc:
+            bindings = f"ESM FAIL (exit {exc.code})"
         m = find_launch_spawn(text)
         print("== dry-run ==")
+        print(f"  bindings: {bindings}")
         print(f"  spawn site: {'FOUND' if m else 'MISSING'}")
         print("  would insert sand-brain supervisor-prestart before HOST_ENTRY spawn")
         print("  would node --check FULL supervisor after write")
+        print("  inserted block must NOT contain require(")
         return "dry-run"
 
     stamp = time.strftime("%Y%m%dT%H%M%SZ")
@@ -249,10 +356,9 @@ def install(
         wrote = True
         node_check(supervisor)
         body = read(supervisor)
+        prestart_block_ok(body)
         if not already_installed(body):
-            die("post-check: prestart marker missing after write")
-        if find_launch_spawn(body) is None:
-            die("post-check: HOST_ENTRY spawn missing after write")
+            die("post-check: prestart not healthy after write")
     except SystemExit:
         if wrote:
             shutil.copy2(bk, supervisor)
@@ -265,7 +371,7 @@ def install(
         die(f"install failed, restored backup: {exc!r}")
 
     print("DONE.")
-    print("  launchHost will run ~/sand-data/ensure-brain-overlay.py before spawn.")
+    print("  launchHost will run ensure-brain-overlay.py via ESM execFileSync before spawn.")
     print("  Wrap is live only after a host process START that already has the wrap on disk.")
     print("  Desktop Quit Grok Bot does NOT restart host-main.")
     print("  Do NOT forceNow / restart-host / Update Computer to apply.")
