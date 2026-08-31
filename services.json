@@ -1,0 +1,13 @@
+{
+  "services": [
+    {
+      "port": 18791,
+      "name": "deepseek-hop",
+      "probe_url": "http://127.0.0.1:18791/healthz"
+    }
+  ],
+  "watched_files": [
+    "C:\\Users\\jmage\\AppData\\Roaming\\Grok Bot\\model-bindings.json"
+  ],
+  "persistence": []
+}

@@ -21,6 +21,7 @@ FALLBACK = {
   "claude-fable-5-oauth-3": {"prov":"anthropic"},
   "gemini-3.7-flash": {"prov":"gemini"}, "gemini-3.7-flash-high": {"prov":"gemini"},
   "glm-5.3": {"prov":"glm"}, "glm-5.3-flash": {"prov":"glm"},
+  "deepseek-v4-flash": {"prov":"deepseek"},
   "deepseek/deepseek-v4-pro-0813": {"prov":"nanogpt"},
   "deepseek/deepseek-v4-pro-0813:thinking": {"prov":"nanogpt"},
   "qwen3.8-max": {"prov":"qwen"}, "local-qwen38-27b": {"prov":"local"},
@@ -28,7 +29,7 @@ FALLBACK = {
   "local-ornith-35b": {"prov":"local"},
 }
 PROV_LABEL = {"grok":"xAI","anthropic":"Claude","gemini":"Gemini","glm":"GLM",
-              "nanogpt":"DeepSeek","qwen":"Qwen","local":"Local","custom":"Custom",
+              "deepseek":"DeepSeek","nanogpt":"DeepSeek","qwen":"Qwen","local":"Local","custom":"Custom",
               "openai":"OpenAI","openrouter":"OpenRouter","ollama":"Ollama"}
 
 AI_PROMPT = """Configure Grok Bot model bindings. Return ONLY JSON: {"agents":{"<id>":{"name":str,"modelId":str,"provider":str,"hopBaseUrl":str,"parameters":[{"id":"effort","value":"low|medium|high|max"}],"maxMode":bool}}}
@@ -79,6 +80,17 @@ def fetch_models(hop):
         elif isinstance(obj, list):
             for v in obj: scan(v, route_hint)
     scan(h)
+    seen = {x["model"] for x in models}
+    for k, meta in FALLBACK.items():
+        if k not in seen:
+            models.append({"model": k, "route": meta.get("prov", "catalog")})
+    def rank(m):
+        n = m["model"]
+        if n == "grok-4.6": return (0, n)
+        if n.startswith("grok"): return (1, n)
+        if n.startswith("deepseek-v4-flash"): return (2, n)
+        return (3, n)
+    models.sort(key=rank)
     return models, h
 
 PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>models</title><style>
@@ -130,6 +142,10 @@ const $=s=>document.querySelector(s),$$=s=>document.querySelectorAll(s);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function show(t,c){const m=$("#msg");m.textContent=t;m.className=c||""}
 function provOf(m){return (MODELS.find(x=>x.model===m)||{}).route||"?"}
+function hopOrigin(model){
+  if(/^deepseek/i.test(model||"")) return "http://127.0.0.1:18791";
+  return "";
+}
 async function boot(){
   const r=await(await fetch('/api/state')).json();ST=r;MODELS=r.models;
   $("#hopinfo").textContent=r.live?`${MODELS.length} models · live hop`:`${MODELS.length} models · catalog`;
@@ -145,14 +161,21 @@ async function boot(){
       <div class=pick><select class=model>${opts}</select><span class="pill r" data-pill>${esc(provOf(cur))}</span></div>
       <button class=tbtn data-test>test</button>
     </div>`}).join("");
-  $$("select.model").forEach(s=>s.onchange=()=>{const p=s.closest(".agent").querySelector("[data-pill]");p.textContent=provOf(s.value)});
+  $$("select.model").forEach(s=>s.onchange=()=>{
+    const ag=s.closest(".agent");
+    ag.querySelector("[data-pill]").textContent=provOf(s.value);
+    const origin=hopOrigin(s.value);
+    ag.querySelector(".rt").textContent=origin?"hop :18791":"direct";
+  });
   $$("[data-test]").forEach(b=>b.onclick=()=>test(b));
   show(r.live?"live models loaded":"using catalog (hop offline)", r.live?"ok":"");
 }
 async function test(btn){
   const ag=btn.closest(".agent"),sel=ag.querySelector("select.model");
+  const origin=hopOrigin(sel.value);
+  if(!origin){btn.textContent="n/a";setTimeout(()=>btn.textContent="test",2500);return;}
   btn.textContent="…";
-  const r=await(await fetch("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:sel.value,baseUrl:ST.hop})})).json();
+  const r=await(await fetch("/api/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:sel.value,baseUrl:origin})})).json();
   btn.textContent=r.ok?"live":"err";btn.style.color=r.ok?"var(--ok)":"var(--bad)";
   setTimeout(()=>{btn.textContent="test";btn.style.color=""},2500);
 }
@@ -161,7 +184,9 @@ async function save(){
   const agents={};
   $$(".agent").forEach(el=>{
     const id=el.dataset.id,base=ST.agents[id]||{};
-    agents[id]={...base, modelId:el.querySelector("select.model").value};
+    const modelId=el.querySelector("select.model").value;
+    const origin=hopOrigin(modelId);
+    agents[id]={...base, modelId, hopBaseUrl:origin?origin+"/v1":"", provider:/^deepseek/i.test(modelId)?"deepseek":(/^grok/i.test(modelId)?"grok":(base.provider||""))};
   });
   const r=await(await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({agents})})).json();
   if(r.ok)show(r.pushed?"saved + pushed to box ✓":"saved locally ✓ (relay off)","ok");
@@ -224,7 +249,7 @@ class H(BaseHTTPRequestHandler):
             base = (req.get("baseUrl") or "").rstrip("/")
             model = req.get("model") or ""
             if not base.startswith("http"): return self._j(400, {"err":"bad base"})
-            body = json.dumps({"modelId":model,"messages":[{"role":"user","content":"ping"}],"max_tokens":8}).encode()
+            body = json.dumps({"model":model,"modelId":model,"messages":[{"role":"user","content":"ping"}],"max_tokens":8}).encode()
             rq = urllib.request.Request(base+"/v1/chat/completions", data=body, method="POST")
             rq.add_header("Content-Type","application/json")
             try:

@@ -1,0 +1,42 @@
+Per-Bot DeepSeek — stay on cursor
+
+Default is Grok 4.6. Assigned UUIDs hop to api.deepseek.com using
+~/sand-data/deepseek.env (DEEPSEEK_API_KEY=...). Unassigned Bots get a
+raw Cursor session (no Proxy). Live id is lazy conv= at create
+(where=store) or where=none.
+
+Do NOT:
+  ./adapters use deepseek
+  ./adapters recover
+  ./adapters restart-host
+  python3 brain-install-bundle.py
+
+Intro dead / out of sync: fully Quit Grok Bot and reopen. Stay on cursor.
+Reset computer last.
+
+Attach (Grok already chats; provider is cursor):
+
+  1. Copy from Explorer:
+       tools/brain-router.cjs      -> ~/sand-host/brain-router.cjs
+       tools/patch-brain-hook.py   -> ~/sand-data/patch-brain-hook.py
+       tools/brain-assign.py       -> ~/sand-data/brain-assign.py
+
+  2. printf 'DEEPSEEK_API_KEY=sk-...\n' > ~/sand-data/deepseek.env
+     chmod 600 ~/sand-data/deepseek.env
+
+  3. python3 ~/sand-data/patch-brain-hook.py
+     Fully Quit Grok Bot, reopen, Create new Bot.
+     Do not restart-host.
+
+  4. grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8
+     Want brain=grok and where=none or where=store — not where=stream.
+     Dashboard must not move.
+
+  5. After a Bot intros: python3 ~/sand-data/brain-assign.py on <uuid>
+     Next createSession with that id hops. Another Bot stays grok.
+
+Daily (no restart):
+  python3 ~/sand-data/brain-assign.py on|off <UUID>
+  python3 ~/sand-data/brain-assign.py list
+
+Clone = new UUID; on again.

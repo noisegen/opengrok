@@ -1,0 +1,15 @@
+Toggle this Bot between Grok 4.6 (default) and DeepSeek.
+
+Stay on ./adapters use cursor. Never adapters use deepseek.
+
+UUID from lazy conv= in /tmp/sand-host-manual.log (where=store or where=none).
+
+  python3 /home/box/sand-data/brain-assign.py list
+  python3 /home/box/sand-data/brain-assign.py on <UUID> --name "My Bot"
+  python3 /home/box/sand-data/brain-assign.py off <UUID>
+
+Key file: ~/sand-data/deepseek.env with DEEPSEEK_API_KEY=...
+
+New Bots stay Grok. Clones need on again.
+
+If intro fails: do not restart-host or recover. Quit Grok Bot and reopen.
