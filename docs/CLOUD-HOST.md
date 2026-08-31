@@ -146,6 +146,14 @@ python3 ~/sand-data/ensure-brain-overlay.py
 python3 tools/doctor.py --fix
 ```
 
+`ensure-brain-overlay.py` / `patch-brain-hook.py` support **both** stock shapes
+(prefer xAI locator when present; otherwise Cursor-native):
+
+| Shape | How we know | Wrap site |
+|---|---|---|
+| grok-bot-setup | `createXaiPromptSession` + `inferenceProvider !== "cursor"` | replace that if-block |
+| recovered Cursor-native (e.g. host version `112ba04`) | no xAI branch; `const session = createCursorInferencePromptSession({...}); return session;` | wrap that call/return; `nativeFactory` is the same invocation |
+
 Fail-closed rules:
 
 1. **Backup first** — timestamped dir under `sand-data/`.

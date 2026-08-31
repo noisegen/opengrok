@@ -42,7 +42,10 @@ Attach (Grok already chats; provider is cursor):
 After Computer recover / host update (stock sand-host again):
 
   Bindings in ~/sand-data/brain-bindings.json SURVIVE. The host consumer
-  does NOT. Re-apply without hand-editing host-main.cjs:
+  does NOT. Recovered hosts may be Cursor-native only (no xAI branch) —
+  ensure detects that shape and wraps createCursorInferencePromptSession.
+
+  Re-apply without hand-editing host-main.cjs:
 
     python3 ~/sand-data/ensure-brain-overlay.py
     # or: python3 ~/sand-data/../tools/doctor.py --fix   (on a clone)

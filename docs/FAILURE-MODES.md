@@ -114,12 +114,17 @@ Legend: SYMPTOM (what you see) → CAUSE (what's actually wrong) → LOCK (the f
   and host disagree about who owns the session.
 - **CAUSE:** assignments live in `sand-data` (survives recover). The binding
   consumer (`sand-host/host-main.cjs` hook + `sand-host/brain-router.cjs`) lives
-  in `sand-host` and is rewritten to stock. A one-shot hand patch without
-  re-apply-on-boot / doctor heal leaves identity labels pointing at a hop the
-  process no longer safely implements.
+  in `sand-host` and is rewritten to stock. Recovered hosts may come back as a
+  **Cursor-native-only** bundle (no `createXaiPromptSession` / no
+  `inferenceProvider` branch — session factory is
+  `createCursorInferencePromptSession` only). An xAI-era locator that requires
+  those symbols correctly refuses to half-patch, but without a Cursor-native
+  locator the hop cannot be re-applied and leftover DeepSeek bindings desync.
 - **LOCK:** keep durable copies under `sand-data` (`brain-router.cjs`,
   `ensure-brain-overlay.py`, `patch-brain-hook.py`). After recover run
   `python3 ~/sand-data/ensure-brain-overlay.py` (or `doctor.py --fix`). Ensure
+  detects **both** host shapes (grok-bot-setup xAI branch, or recovered
+  Cursor-native wrap of `const session = createCursorInferencePromptSession`),
   is idempotent, backs up first, verifies fail-closed hook markers, and
   **restores** `host-main` on any post-write failure. Runtime hop create/key
   errors fall back to native Grok loudly; unassigned bots never enter the hop.

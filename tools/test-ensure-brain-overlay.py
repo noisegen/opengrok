@@ -39,6 +39,29 @@ STOCK_HOOK = (
     "const session = createCursorInferencePromptSession({\n"
 )
 
+# Recovered production host (version 112ba04): Cursor-native only — no xAI branch.
+CURSOR_NATIVE_HOOK = """
+function resolveSandRequestedModel(opts) { return (opts && opts.modelId) || "grok-4.6"; }
+function createCursorInferencePromptSession(opts) { return { kind: "cursor", opts: opts }; }
+function createSession(options2, sessionOptions, onRequestId) {
+      const requestedModel = resolveSandRequestedModel({
+        modelId: "grok-4.6",
+        sessionOptions
+      });
+      const session = createCursorInferencePromptSession({
+        getAccessToken: options2.getAccessToken,
+        getTeamId: options2.getTeamId,
+        getMachineId: options2.getMachineId,
+        requestedModel,
+        inferenceReason: options2.isGeminiVideoDeveloperApiEnabled?.() === true ? sessionOptions?.inferenceReason : void 0,
+        onRequestId,
+        ...sessionOptions?.lineage != null ? { lineage: sessionOptions.lineage } : {}
+      });
+      return session;
+}
+module.exports = { createSession };
+"""
+
 
 def write_stock_host(host_dir: Path) -> Path:
     host_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +75,26 @@ def write_stock_host(host_dir: Path) -> Path:
         encoding="utf-8",
     )
     return host
+
+
+def write_cursor_native_host(host_dir: Path) -> Path:
+    host_dir.mkdir(parents=True, exist_ok=True)
+    host = host_dir / "host-main.cjs"
+    host.write_text(
+        "// recovered Cursor-native host (xAI branch absent)\n"
+        + CURSOR_NATIVE_HOOK,
+        encoding="utf-8",
+    )
+    # Deliberately no xai-prompt-session.cjs — matches live recover.
+    return host
+
+
+def load_patch():
+    path = HERE / "patch-brain-hook.py"
+    spec = importlib.util.spec_from_file_location("pbh_cursor", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class EnsureBrainOverlayTests(unittest.TestCase):
@@ -303,6 +346,179 @@ class DoctorBrainOverlayTests(unittest.TestCase):
             self.assertIn("brain:desync", r.stdout)
         finally:
             td.cleanup()
+
+    def test_desync_detected_on_cursor_native_stock(self):
+        td = tempfile.TemporaryDirectory()
+        try:
+            root = Path(td.name)
+            host_dir = root / "sand-host"
+            sand = root / "sand-data"
+            sand.mkdir()
+            write_cursor_native_host(host_dir)
+            (sand / "brain-bindings.json").write_text(
+                json.dumps(
+                    {
+                        "agents": {
+                            "cccccccc-0000-4000-8000-000000000003": {
+                                "brain": "deepseek",
+                                "name": "Long Run",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["SAND_HOST"] = str(host_dir)
+            env["SAND_DATA"] = str(sand)
+            env["BRAIN_BINDINGS"] = str(sand / "brain-bindings.json")
+            driver = root / "drive_doctor_brain.py"
+            driver.write_text(
+                "import os, sys\n"
+                f"sys.path.insert(0, {str(TOOLS)!r})\n"
+                "import doctor\n"
+                "from pathlib import Path\n"
+                "doctor.results.clear()\n"
+                "doctor.HOST_DIR = Path(os.environ['SAND_HOST'])\n"
+                "doctor.SAND_DATA = Path(os.environ['SAND_DATA'])\n"
+                "doctor.BRAIN_BINDINGS = Path(os.environ['BRAIN_BINDINGS'])\n"
+                "doctor.check_brain_overlay()\n"
+                "fails=[r for r in doctor.results if r[0]=='FAIL']\n"
+                "print('FAILS', len(fails))\n"
+                "for r in fails: print(r[1])\n"
+                "sys.exit(2 if fails else 0)\n",
+                encoding="utf-8",
+            )
+            r = subprocess.run(
+                [sys.executable, str(driver)], capture_output=True, text=True, env=env
+            )
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("brain:desync", r.stdout)
+        finally:
+            td.cleanup()
+
+
+class CursorNativePatchTests(unittest.TestCase):
+    """Recovered Cursor-only host (no createXaiPromptSession) — production shape."""
+
+    def setUp(self):
+        self.mod = load_ensure()
+        self.pbh = load_patch()
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self.host_dir = self.root / "sand-host"
+        self.sand = self.root / "sand-data"
+        self.sand.mkdir()
+        write_cursor_native_host(self.host_dir)
+        (self.sand / "brain-bindings.json").write_text(
+            json.dumps(
+                {
+                    "default": "grok",
+                    "agents": {
+                        "71b408bd-0c94-494b-8a45-754bc0ef2d73": {
+                            "brain": "deepseek",
+                            "name": "Long Run",
+                        }
+                    },
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _ensure(self, **kwargs):
+        buf = StringIO()
+        err = StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            status = self.mod.ensure(
+                str(self.host_dir),
+                str(self.sand),
+                str(TOOLS),
+                **kwargs,
+            )
+        return status, buf.getvalue(), err.getvalue()
+
+    def test_detect_shape_cursor_native(self):
+        text = (self.host_dir / "host-main.cjs").read_text(encoding="utf-8")
+        self.assertEqual(self.pbh.detect_shape(text), "cursor-native")
+        self.assertNotIn("createXaiPromptSession", text)
+        self.assertNotIn('inferenceProvider !== "cursor"', text)
+        self.assertFalse((self.host_dir / "xai-prompt-session.cjs").exists())
+
+    def test_stock_cursor_native_applies(self):
+        status, out, _ = self._ensure()
+        self.assertEqual(status, "applied", out)
+        host = (self.host_dir / "host-main.cjs").read_text(encoding="utf-8")
+        self.assertIn("sand-brain pass-through", host)
+        self.assertIn("createLazyBrainSession", host)
+        self.assertIn("overlay failed, native", host)
+        self.assertIn("nativeFactory", host)
+        self.assertIn("getAccessToken: options2.getAccessToken", host)
+        # Fail-closed stock path preserved inside catch.
+        self.assertIn("createCursorInferencePromptSession", host)
+        self.assertNotIn("createXaiPromptSession", host)
+        self.assertNotIn('inferenceProvider !== "cursor"', host)
+        self.assertTrue((self.host_dir / "brain-router.cjs").is_file())
+        # Syntax-valid.
+        r = subprocess.run(
+            ["node", "--check", str(self.host_dir / "host-main.cjs")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Patch itself is idempotent on the bytes.
+        self.assertEqual(host, self.pbh.patch(host))
+
+    def test_cursor_native_idempotent_noop(self):
+        self._ensure()
+        status, out, _ = self._ensure()
+        self.assertEqual(status, "noop")
+        self.assertIn("no changes needed", out)
+
+    def test_cursor_native_rewrite_reapplies(self):
+        self._ensure()
+        write_cursor_native_host(self.host_dir)
+        router = self.host_dir / "brain-router.cjs"
+        if router.exists():
+            router.unlink()
+        status, out, _ = self._ensure()
+        self.assertEqual(status, "applied", out)
+        host = (self.host_dir / "host-main.cjs").read_text(encoding="utf-8")
+        self.assertIn("createLazyBrainSession", host)
+        self.assertTrue(router.is_file())
+
+    def test_cursor_native_dry_run_reports_shape(self):
+        status, out, _ = self._ensure(dry_run=True)
+        self.assertEqual(status, "dry-run")
+        self.assertIn("cursor-native", out)
+        self.assertFalse((self.host_dir / "brain-router.cjs").exists())
+
+    def test_patch_prefers_xai_when_both_present(self):
+        # xAI shape also contains a createCursorInferencePromptSession call;
+        # detect_shape must prefer xai.
+        text = (
+            'if (inferenceProvider !== "cursor") {\n'
+            " try {\n"
+            '  const { createXaiPromptSession } = require("./xai-prompt-session.cjs");\n'
+            "  return createXaiPromptSession({ requestedModel, onRequestId, sessionOptions });\n"
+            " } catch (e) {}\n"
+            "}\n"
+            "const session = createCursorInferencePromptSession({\n"
+            "  getAccessToken: options2.getAccessToken,\n"
+            "  requestedModel,\n"
+            "  onRequestId,\n"
+            "});\n"
+            "return session;\n"
+        )
+        self.assertEqual(self.pbh.detect_shape(text), "xai")
+        out = self.pbh.patch(text)
+        self.assertIn("createXaiPromptSession", out)
+        self.assertIn("createLazyBrainSession", out)
+        self.assertEqual(out, self.pbh.patch(out))
 
 
 if __name__ == "__main__":

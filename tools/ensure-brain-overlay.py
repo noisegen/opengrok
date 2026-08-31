@@ -184,14 +184,24 @@ def ensure(
             print("  bindings: hop intent present; consumer installed")
         return "noop"
 
-    if "createXaiPromptSession" not in host_text:
+    # Load patch module early so dry-run can report detected shape.
+    mod = load_patch_mod(patch_py)
+    shape = None
+    if hasattr(mod, "detect_shape"):
+        shape = mod.detect_shape(host_text)
+    elif "createXaiPromptSession" in host_text:
+        shape = "xai"
+    if shape is None:
         die(
-            "createXaiPromptSession missing from host-main — upstream bundle "
-            "is not a patchable grok-bot-setup host (refusing to half-patch)"
+            "unrecognized host-main shape — need grok-bot-setup "
+            "(createXaiPromptSession + inferenceProvider) or recovered "
+            "Cursor-native (const session = createCursorInferencePromptSession; "
+            "return session). Refusing to half-patch"
         )
 
     if dry_run:
         print("== dry-run ==")
+        print(f"  shape:  {shape}")
         print(f"  host:   {'HEALTHY' if overlay_healthy(host_text, router_dest) else 'NEEDS PATCH'}")
         print(f"  router: {'in sync' if router_same else 'MISSING/DRIFT'}")
         print(f"  would copy {router_src} -> {router_dest}")
@@ -205,6 +215,7 @@ def ensure(
     if os.path.isfile(router_dest):
         shutil.copy2(router_dest, os.path.join(bk_dir, "brain-router.cjs.bak"))
     print(f"  backups -> {bk_dir}")
+    print(f"  shape: {shape}")
 
     wrote_host = False
 
@@ -221,7 +232,6 @@ def ensure(
         node_check(router_dest)
         router_loads(router_dest)
 
-        mod = load_patch_mod(patch_py)
         mod.HOST = host_main
         mod.ROUTER = router_dest
         before = read(host_main)
@@ -229,7 +239,7 @@ def ensure(
         if after != before:
             write(host_main, after)
             wrote_host = True
-            print(f"  [host]   {host_main} patched")
+            print(f"  [host]   {host_main} patched ({shape})")
         else:
             print("  [host]   already patched")
 
