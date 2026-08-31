@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """grok-native doctor — find every failure point BEFORE it bites.
 
-Checks (each maps to a registered failure mode in docs/FAILURE-MODES.md, F01–F18):
+Checks (each maps to a registered failure mode in docs/FAILURE-MODES.md, F01–F19):
 
   SERVICES      expected listening sockets + identity probes
   AUTH/BINDING  model-bindings.json integrity (count, names, SHA drift)
+  BRAIN OVERLAY sand-data hop intent vs live sand-host consumer (F19)
   CONFIG DRIFT  hermes config.yaml provider flags (discover_models, vision)
   FILES         SHA baselines of the pieces that must never silently change
   GROK CACHE    models_cache.json age/version (silent-update detector)
@@ -18,7 +19,9 @@ Modes:
   --json         machine report to stdout (adds PIDs/timestamp detail)
   --fix          SAFE auto-heals ONLY: hermes-hop relaunch via its VBS,
                  claude-shim via canonical restart-shim.py, antigravity via
-                 its Startup VBS. Never force-kills a live listener.
+                 its Startup VBS, brain overlay via ensure-brain-overlay.py
+                 when bindings want a hop but the host is stock/desynced.
+                 Never force-kills a live listener.
 """
 from __future__ import annotations
 
@@ -229,7 +232,132 @@ def check_persistence() -> None:
         ok = (STARTUP / vbs).exists()
         emit("PASS" if ok else "WARN", "startup:vbs", f"{vbs} {'present' if ok else 'MISSING'}")
 
+# Brain overlay (F19): durable sand-data bindings without a live host consumer.
+HOST_DIR = Path(os.environ.get("SAND_HOST", str(HOME / "sand-host")))
+SAND_DATA = Path(os.environ.get("SAND_DATA", str(HOME / "sand-data")))
+BRAIN_BINDINGS = Path(
+    os.environ.get("BRAIN_BINDINGS", str(SAND_DATA / "brain-bindings.json"))
+)
+
+def _hop_intent(bindings: Path) -> bool:
+    if not bindings.exists():
+        return False
+    try:
+        data = json.loads(bindings.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    agents = data.get("agents") or {}
+    native = {"grok", "cursor", "stock", ""}
+    for ent in agents.values():
+        if not isinstance(ent, dict):
+            continue
+        brain = str(ent.get("brain") or "").lower()
+        if brain and brain not in native:
+            return True
+    return False
+
+def _overlay_healthy(host_main: Path, router: Path) -> bool:
+    if not host_main.exists() or not router.exists():
+        return False
+    try:
+        txt = host_main.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    return (
+        "sand-brain pass-through" in txt
+        and "createLazyBrainSession" in txt
+        and "overlay failed, native" in txt
+        and "createCursorInferencePromptSession" in txt
+    )
+
+def check_brain_overlay() -> dict:
+    """F19 — hop intent in sand-data must match a live fail-closed host consumer."""
+    meta: dict = {"hop_intent": False, "healthy": False, "host_present": False}
+    host_main = HOST_DIR / "host-main.cjs"
+    router = HOST_DIR / "brain-router.cjs"
+    meta["host_present"] = host_main.exists()
+    intent = _hop_intent(BRAIN_BINDINGS)
+    meta["hop_intent"] = intent
+    healthy = _overlay_healthy(host_main, router)
+    meta["healthy"] = healthy
+
+    # Half-applied: hook references router but file is gone (fleet-brick risk).
+    if host_main.exists():
+        try:
+            txt = host_main.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            emit("FAIL", "brain:overlay", f"unreadable host-main: {exc!r}")
+            return meta
+        if "createLazyBrainSession" in txt and not router.exists():
+            emit(
+                "FAIL",
+                "brain:desync",
+                "host hook requires brain-router.cjs but file MISSING "
+                "(stock recover / half-patch) — run ensure-brain-overlay.py",
+            )
+            return meta
+        if "createLazyBrainSession" in txt and "overlay failed, native" not in txt:
+            emit(
+                "FAIL",
+                "brain:desync",
+                "brain hook present without fail-closed native catch — "
+                "run ensure-brain-overlay.py",
+            )
+            return meta
+
+    if intent and not meta["host_present"]:
+        # Not on a box — WARN only (laptop doctor runs without sand-host).
+        emit(
+            "WARN",
+            "brain:overlay",
+            f"hop intent in {BRAIN_BINDINGS.name} but no sand-host here "
+            f"({host_main}) — re-apply on the Grok Bot computer",
+        )
+        return meta
+
+    if intent and not healthy:
+        emit(
+            "FAIL",
+            "brain:desync",
+            "bindings want a non-Grok brain but host overlay is stock/unhealthy "
+            "— run: python3 tools/ensure-brain-overlay.py (or doctor --fix)",
+        )
+        return meta
+
+    if healthy:
+        emit("PASS", "brain:overlay", "fail-closed consumer installed")
+    elif not intent:
+        emit("PASS", "brain:overlay", "no hop intent (native Grok only)")
+    return meta
+
 # --- fix ---------------------------------------------------------------------
+def try_fix_brain_overlay() -> None:
+    ensure = HERE / "ensure-brain-overlay.py"
+    if not ensure.exists():
+        sand_ensure = SAND_DATA / "ensure-brain-overlay.py"
+        ensure = sand_ensure if sand_ensure.exists() else ensure
+    if not ensure.exists():
+        emit("WARN", "fix:brain-overlay", "ensure-brain-overlay.py not found; MANUAL")
+        return
+    if not (HOST_DIR / "host-main.cjs").exists():
+        emit("WARN", "fix:brain-overlay", f"no host at {HOST_DIR}; skip")
+        return
+    cmd = [
+        sys.executable,
+        str(ensure),
+        "--host-dir", str(HOST_DIR),
+        "--sand", str(SAND_DATA),
+        "--tools", str(HERE),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    detail = (r.stdout or "").strip().splitlines()
+    tail = detail[-1] if detail else (r.stderr or "")[-160:]
+    emit(
+        "INFO" if r.returncode == 0 else "FAIL",
+        "fix:brain-overlay",
+        f"ensure rc={r.returncode} {tail}",
+    )
+
 def try_fix(dead_names: list[str]) -> None:
     fixes = {
         "hermes-hop": ["cscript", "//nologo", str(STARTUP / "hermes-hop.vbs")],
@@ -254,6 +382,7 @@ def try_fix(dead_names: list[str]) -> None:
 def run(fix: bool) -> tuple[int, str]:
     check_services()
     bmeta = check_bindings()
+    brain_meta = check_brain_overlay()
     cfgflags = check_config()
     gcache = check_grok_cache()
     check_persistence()
@@ -294,13 +423,16 @@ def run(fix: bool) -> tuple[int, str]:
         "new_warn": [{"tag": t, "detail": d} for _, t, d in new_warns],
         "known_warn_count": len(warns) - len(new_warns),
         "bindings_agent_count": bmeta.get("agent_count"),
+        "brain_overlay": brain_meta,
         "grok_cache": gcache,
     }
 
-    if fix and fails:
+    if fix:
         dead = [t.split(":")[1] for lvl, t, _ in results
                 if lvl == "FAIL" and t.startswith("svc:")]
         try_fix(dead)
+        if any(t == "brain:desync" for _, t, _ in fails):
+            try_fix_brain_overlay()
 
     def fmt(level, tag, detail):
         return f"[{level}] {tag} :: {detail}"

@@ -106,6 +106,25 @@ Legend: SYMPTOM (what you see) → CAUSE (what's actually wrong) → LOCK (the f
 - **CAUSE:** exclusive locks on credential databases.
 - **LOCK:** dedicated profiles/dir copies for automation; never fight the user's live session.
 
+### F19 — Durable hop bindings, stock host after recover (fleet desync)
+- **SYMPTOM:** after Grok Bot Computer recover / host update, sidebar and
+  `brain-bindings.json` still say DeepSeek (or another hopped brain), but the
+  live host is stock again. Native Grok bots crash or the whole fleet dies when
+  a half-applied overlay `require()`s a missing `brain-router.cjs`, or when hop
+  and host disagree about who owns the session.
+- **CAUSE:** assignments live in `sand-data` (survives recover). The binding
+  consumer (`sand-host/host-main.cjs` hook + `sand-host/brain-router.cjs`) lives
+  in `sand-host` and is rewritten to stock. A one-shot hand patch without
+  re-apply-on-boot / doctor heal leaves identity labels pointing at a hop the
+  process no longer safely implements.
+- **LOCK:** keep durable copies under `sand-data` (`brain-router.cjs`,
+  `ensure-brain-overlay.py`, `patch-brain-hook.py`). After recover run
+  `python3 ~/sand-data/ensure-brain-overlay.py` (or `doctor.py --fix`). Ensure
+  is idempotent, backs up first, verifies fail-closed hook markers, and
+  **restores** `host-main` on any post-write failure. Runtime hop create/key
+  errors fall back to native Grok loudly; unassigned bots never enter the hop.
+  Doctor `brain:desync` FAILs when hop intent exists without a healthy consumer.
+
 ---
 
 *Additions welcome — include reproduction steps and the lock that worked.*

@@ -109,8 +109,6 @@ def _is_current(block: str) -> bool:
 def patch(text: str) -> str:
     if "createXaiPromptSession" not in text:
         die("createXaiPromptSession missing — run ./adapters patch-host")
-    if "sand-brain pass-through" in text and "createLazyBrainSession" in text:
-        return text
     m = re.search(
         r"if\s*\(\s*inferenceProvider\s*!==\s*[\"']cursor[\"']\s*\)\s*\{",
         text,
@@ -119,11 +117,21 @@ def patch(text: str) -> str:
         r"try\s*\{\s*(?:/\*[\s\S]*?\*/\s*)?const\s*\{\s*createLazyBrainSession",
         text,
     )
+    # Already-healthy (or stale) lazy overlay sits BEFORE the inferenceProvider if.
     if m_try and m and m_try.start() < m.start():
         close = closing_brace(text, m.end() - 1)
         if close < 0:
             die("unclosed if-block")
+        block = text[m_try.start() : close + 1]
+        if _is_current(block):
+            return text  # idempotent no-op
         return text[: m_try.start()] + NEW + text[close + 1 :]
+    if "sand-brain pass-through" in text and "createLazyBrainSession" in text:
+        # Marker present but we could not locate a replaceable try+if pair — drift.
+        die(
+            "sand-brain markers present but hook shape unmatched — "
+            "upstream host drift; refusing to half-patch"
+        )
     if not m:
         idx = text.find("createXaiPromptSession")
         print(text[max(0, idx - 200) : idx + 400] if idx >= 0 else "no hook")

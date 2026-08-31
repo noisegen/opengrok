@@ -426,10 +426,20 @@ function createDeepseekHopSession(brain, opts) {
 }
 
 function brandedHop(opts, so, brain) {
-  if (typeof opts.createHopSession === "function") {
-    return opts.createHopSession(brain, opts, so);
+  try {
+    if (typeof opts.createHopSession === "function") {
+      return opts.createHopSession(brain, opts, so);
+    }
+    return createDeepseekHopSession(brain, opts);
+  } catch (err) {
+    logLine("hop create failed -> native: " + ((err && err.message) || err));
+    try {
+      console.error("[sand-brain] hop create failed, native:", err);
+    } catch {
+      /* ignore */
+    }
+    return null;
   }
-  return createDeepseekHopSession(brain, opts);
 }
 
 function brainLog(convId, brainId, where) {

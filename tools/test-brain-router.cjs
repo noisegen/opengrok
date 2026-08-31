@@ -580,4 +580,16 @@ const lazyNoKey = createLazyBrainSession({
 lazyNoKey.getExecutor([]).stream(new Map([[cidKey, LONG_RUN]]), "inv-nokey", []);
 assert.ok(createdNo.kind.startsWith("native"));
 
+// Hop factory throws → fail closed to native (never brick the createSession path).
+const createdBoom = { ready: false, kind: "" };
+const lazyBoom = createLazyBrainSession({
+  sessionOptions: { conversationId: LONG_RUN, modelId: "grok-4.6" },
+  nativeFactory: () => fakeSession("native-after-hop-boom", createdBoom),
+  createHopSession: () => {
+    throw new Error("simulated hop explode");
+  },
+});
+assert.strictEqual(createdBoom.kind, "native-after-hop-boom");
+assert.strictEqual(typeof lazyBoom.getExecutor, "function");
+
 console.log("ok");

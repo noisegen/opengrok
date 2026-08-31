@@ -16,15 +16,19 @@ Reset computer last.
 
 Attach (Grok already chats; provider is cursor):
 
-  1. Copy from Explorer:
-       tools/brain-router.cjs      -> ~/sand-host/brain-router.cjs
-       tools/patch-brain-hook.py   -> ~/sand-data/patch-brain-hook.py
-       tools/brain-assign.py       -> ~/sand-data/brain-assign.py
+  1. Copy from Explorer (DURABLE copies must live under sand-data —
+     sand-host is wiped on Computer recover / host update):
+       tools/brain-router.cjs         -> ~/sand-data/brain-router.cjs
+       tools/brain-router.cjs         -> ~/sand-host/brain-router.cjs
+       tools/patch-brain-hook.py      -> ~/sand-data/patch-brain-hook.py
+       tools/ensure-brain-overlay.py  -> ~/sand-data/ensure-brain-overlay.py
+       tools/brain-assign.py          -> ~/sand-data/brain-assign.py
 
   2. printf 'DEEPSEEK_API_KEY=sk-...\n' > ~/sand-data/deepseek.env
      chmod 600 ~/sand-data/deepseek.env
 
-  3. python3 ~/sand-data/patch-brain-hook.py
+  3. python3 ~/sand-data/ensure-brain-overlay.py
+     (or: python3 ~/sand-data/patch-brain-hook.py)
      Fully Quit Grok Bot, reopen, Create new Bot.
      Do not restart-host.
 
@@ -34,6 +38,19 @@ Attach (Grok already chats; provider is cursor):
 
   5. After a Bot intros: python3 ~/sand-data/brain-assign.py on <uuid>
      Next createSession with that id hops. Another Bot stays grok.
+
+After Computer recover / host update (stock sand-host again):
+
+  Bindings in ~/sand-data/brain-bindings.json SURVIVE. The host consumer
+  does NOT. Re-apply without hand-editing host-main.cjs:
+
+    python3 ~/sand-data/ensure-brain-overlay.py
+    # or: python3 ~/sand-data/../tools/doctor.py --fix   (on a clone)
+
+  ensure is idempotent (healthy → "no changes needed"), backs up first,
+  and RESTORES host-main on failure (fail closed — never leave a half
+  patch that bricks native Grok bots). Hop create/key errors also fall
+  back to native Grok loudly.
 
 Daily (no restart):
   python3 ~/sand-data/brain-assign.py on|off <UUID>

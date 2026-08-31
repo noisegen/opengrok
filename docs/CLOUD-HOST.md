@@ -124,3 +124,35 @@ grep -c "applyProviderReasoningControls" /home/box/sand-data/openai-hop-session.
 # then, in the app, send a normal message in the bound conversation:
 tcpdump -i lo port <hop-port>               # expect packets
 ```
+
+## Brain overlay survival (per-Bot DeepSeek hop)
+
+The `model-bindings.json` + `apply-box-patch.py` path above is Contract A/B for
+openai-hop sessions. The **per-Bot brain hop** (DeepSeek via `brain-router.cjs`)
+is a separate overlay — see `tools/BRAIN-SETUP.txt`. Same survival rule:
+
+| Lives across Computer recover? | Path |
+|---|---|
+| Yes (durable) | `~/sand-data/brain-bindings.json`, durable `brain-router.cjs`, `ensure-brain-overlay.py`, `deepseek.env` |
+| No (rewritten stock) | `~/sand-host/host-main.cjs`, `~/sand-host/brain-router.cjs` |
+
+After recover the host is stock again while bindings/labels still say DeepSeek.
+That desync is **F19**. Do **not** hand-edit `host-main.cjs`. Re-apply:
+
+```bash
+# on the box — safe after every recover; no-op when already healthy
+python3 ~/sand-data/ensure-brain-overlay.py
+# or from a clone with paths set:
+python3 tools/doctor.py --fix
+```
+
+Fail-closed rules:
+
+1. **Backup first** — timestamped dir under `sand-data/`.
+2. **Verify** — host must contain `sand-brain pass-through`, `createLazyBrainSession`,
+   and `overlay failed, native` (native catch so a missing router cannot brick the fleet).
+3. **Restore on failure** — any post-write error restores `host-main` from the backup;
+   never leave a half patch.
+4. **Runtime** — hop create/key errors log loudly and fall back to native Grok;
+   unassigned bots never enter the hop path.
+5. **Keys stay off git** — `~/sand-data/deepseek.env` only (`chmod 600`).
