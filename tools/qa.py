@@ -93,7 +93,12 @@ else:
     warns.append("node not found - map tests skipped")
 
 # 5. brain overlay / box-patch suites (stock → apply, noop, drift)
-for name in ("test-brain-install.py", "test-brain-assign.py", "test-ensure-brain-overlay.py"):
+for name in (
+    "test-brain-install.py",
+    "test-brain-assign.py",
+    "test-ensure-brain-overlay.py",
+    "test-install-supervisor-prestart.py",
+):
     r = subprocess.run([sys.executable, str(HERE / "tools" / name)], capture_output=True, text=True)
     if r.returncode:
         tail = ((r.stderr or r.stdout or "").strip().splitlines() or ["?"])[-1]

@@ -324,6 +324,7 @@ def check_brain_overlay() -> dict:
             f"hop intent in {BRAIN_BINDINGS.name} but no sand-host here "
             f"({host_main}) — re-apply on the Grok Bot computer",
         )
+        check_supervisor_prestart()
         return meta
 
     if intent and not healthy:
@@ -332,15 +333,53 @@ def check_brain_overlay() -> dict:
             "brain:desync",
             "bindings want a non-Grok brain but host overlay is stock/unhealthy "
             "— run: python3 tools/ensure-brain-overlay.py (or doctor --fix); "
-            "then Quit Grok Bot and reopen — NEVER forceNow bounce",
+            "wrap is disk-only until next host process start — NEVER forceNow bounce",
         )
+        check_supervisor_prestart()
         return meta
 
     if healthy:
-        emit("PASS", "brain:overlay", "fail-closed durable consumer installed")
+        emit("PASS", "brain:overlay", "fail-closed durable consumer installed on disk")
     elif not intent:
         emit("PASS", "brain:overlay", "no hop intent (native Grok only)")
+
+    # Load path: stock supervisor has no prestart; optional box-side wire.
+    check_supervisor_prestart()
     return meta
+
+
+def check_supervisor_prestart() -> None:
+    """F19 load path — launchHost must call ensure before spawn, or say so."""
+    sup = Path(
+        os.environ.get("SAND_SUPERVISOR", "/usr/local/bin/sand-supervisor.mjs")
+    )
+    if not sup.exists():
+        emit(
+            "WARN",
+            "brain:supervisor-prestart",
+            f"no supervisor at {sup} (not on Grok Bot computer?) — "
+            "stock launchHost has no prestart; wrap cannot auto-reapply after boot-fetch",
+        )
+        return
+    try:
+        txt = sup.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        emit("WARN", "brain:supervisor-prestart", f"unreadable supervisor: {exc!r}")
+        return
+    if "sand-brain supervisor-prestart" in txt and "ensure-brain-overlay.py" in txt:
+        emit(
+            "PASS",
+            "brain:supervisor-prestart",
+            "launchHost runs ensure before spawn (fail-closed)",
+        )
+        return
+    emit(
+        "WARN",
+        "brain:supervisor-prestart",
+        "stock launchHost has no prestart — "
+        "run: python3 ~/sand-data/install-supervisor-prestart.py "
+        "(Update Computer resets supervisor; hop cannot auto-survive that recover)",
+    )
 
 # --- fix ---------------------------------------------------------------------
 def try_fix_brain_overlay() -> None:

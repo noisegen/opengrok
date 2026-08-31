@@ -664,11 +664,21 @@ module.exports = { createCursorSandInference };
         status, out, err = self._ensure()
         self.assertEqual(status, "applied", out)
         blob = out + err
-        self.assertIn("Quit Grok Bot", blob)
-        self.assertRegex(blob, r"NEVER.*(forceNow|Update Grok Bot|restart-host)")
+        self.assertIn("Desktop Quit Grok Bot does NOT restart host-main", blob)
+        self.assertIn("install-supervisor-prestart.py", blob)
+        self.assertIn("CANNOT auto-restore", blob)
+        self.assertRegex(blob, r"NEVER.*(forceNow|restart-host|Update Computer)")
+        self.assertNotIn("Quit Grok Bot and reopen", blob)
         self.assertNotRegex(
             blob,
-            r"(?i)(run|use|do)\s+.*(Update Grok Bot.?s Computer|forceNow|adapters restart-host)",
+            r"(?i)(run|use)\s+.*(Update Grok Bot.?s Computer|forceNow|adapters restart-host)",
+        )
+
+    def test_ensure_syncs_supervisor_installer(self):
+        status, out, _ = self._ensure()
+        self.assertEqual(status, "applied", out)
+        self.assertTrue(
+            (self.sand / "install-supervisor-prestart.py").is_file()
         )
 
     def test_patch_prefers_xai_when_both_present(self):

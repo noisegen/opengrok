@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
-"""ensure-brain-overlay — fail-closed hop that survives boot-fetch / Update Computer.
+"""ensure-brain-overlay — fail-closed host-main wrap (disk only).
 
 PRODUCTION RULES (learned the hard way):
   - NEVER apply a hop by patching host-main then forceNow/supervisor bounce.
     That twice took down the whole Grok Bot fleet; John had to Update Computer
     to recover — and Update Computer boot-fetches a stock sand-host, wiping
-    any sand-host-only overlay.
-  - Overlay living only in sand-host/host-main.cjs is wiped every recover.
+    any sand-host-only overlay. The leftover-`}` stale-upgrade bug is what
+    full-file node --check is meant to catch; do not invent other bounce
+    causes without evidence.
+  - Overlay living only in sand-host/host-main.cjs is wiped every recover /
+    boot-fetch.
   - brain-router.cjs MUST live under sand-data/agent-data (durable). The tiny
     host-main hook loads it from there; require failure → native (fail-closed).
   - Always `node --check` the FULL patched host-main, never a wrap slice.
+  - Desktop Quit Grok Bot does NOT restart host-main (always-on supervisor).
+  - host-prestart-ensure.sh is inert unless sand-supervisor launchHost calls
+    it — see install-supervisor-prestart.py. Stock supervisor has no hook.
 
 What this tool does:
-  1. Sync durable files under sand-data (brain-router, patch, ensure, prestart).
+  1. Sync durable files under sand-data (brain-router, patch, ensure, prestart,
+     install-supervisor-prestart).
   2. Patch host-main with a tiny fail-closed wrap (idempotent).
   3. FULL-file node --check; on any failure RESTORES host-main and exits 1.
-  4. Install host-prestart-ensure.sh so AFTER boot-fetch the hop re-applies
-     BEFORE node starts — no crashy bounce required.
-  5. Never touches API keys.
+  4. Never touches API keys. Never claims quit/reopen loads the wrap.
 
-Apply path (safe):
-  python3 ~/sand-data/ensure-brain-overlay.py
-  # then fully Quit Grok Bot and reopen (loads patched host-main from disk).
-  # OR: wire host-prestart-ensure.sh before node starts host-main after swap.
+Load path (separate from this disk patch):
+  Wrap is live ONLY after a host process START that already has the wrap on
+  disk. Wire that via install-supervisor-prestart.py (patches launchHost to
+  run ensure after boot-fetch swap, before spawn). Update Computer resets
+  supervisor from the image — hop cannot auto-survive that recover until
+  the installer is re-run (no durable automatic hook today).
 
 NEVER: Update Grok Bot's Computer / ./adapters restart-host / forceNow upgrade
 to "apply" a hop.
@@ -43,11 +50,13 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 PRESTART_SH = """#!/usr/bin/env bash
-# Run BEFORE node starts sand-host/host-main.cjs (after boot-fetch swap).
-# Idempotent. Does NOT bounce the host. Does NOT Update Computer.
+# Disk helper: re-apply host-main wrap. Does NOT bounce. Does NOT Update Computer.
+# Stock sand-supervisor.mjs does NOT call this. It is only useful when:
+#   - install-supervisor-prestart.py has patched launchHost to exec ensure, or
+#   - an operator runs it manually BEFORE the next host process start.
 set -euo pipefail
 SAND="${SAND_DATA:-${HOME}/sand-data}"
-# agent-data is often a symlink to sand-data on the live box
+# agent-data is a symlink to sand-data on the live box
 if [[ ! -d "$SAND" && -d "${HOME}/agent-data" ]]; then
   SAND="${HOME}/agent-data"
 fi
@@ -164,6 +173,7 @@ def sync_durable(tools_dir: str, sand: str) -> None:
         "patch-brain-hook.py",
         "ensure-brain-overlay.py",
         "host-prestart-ensure.sh",
+        "install-supervisor-prestart.py",
     ):
         src = os.path.join(tools_dir, name)
         dest = os.path.join(sand, name)
@@ -193,6 +203,19 @@ def sync_durable(tools_dir: str, sand: str) -> None:
             print(f"  durable: {dest}")
 
 
+def _print_load_path(sand: str) -> None:
+    print("  LOAD PATH (honest):")
+    print("    - This wrote/verified host-main on disk only.")
+    print("    - Desktop Quit Grok Bot does NOT restart host-main.")
+    print("    - Wrap is live only after a host process START with wrap already on disk.")
+    print("    - Stock supervisor launchHost has no prestart — wire it with:")
+    print(f"        python3 {os.path.join(sand, 'install-supervisor-prestart.py')}")
+    print("    - Boot-fetch (host swap, supervisor kept): patched launchHost re-ensures.")
+    print("    - Update Computer recover: supervisor resets from image — CANNOT auto-restore")
+    print("      the wrap; re-run install-supervisor-prestart + ensure after recover.")
+    print("    - NEVER forceNow / adapters restart-host / Update Computer to apply.")
+
+
 def ensure(
     host_dir: str,
     sand: str,
@@ -213,7 +236,7 @@ def ensure(
         die(f"host-main missing: {host_main} — run on the Grok Bot computer after recover")
 
     print("== ensure-brain-overlay ==")
-    print("  apply path: disk patch + Quit/reopen OR prestart — NEVER forceNow bounce")
+    print("  disk patch only — does not restart host-main; NEVER forceNow bounce")
     sync_durable(tools_dir, sand)
     router_src = pick_router_src(sand, tools_dir)
 
@@ -228,8 +251,9 @@ def ensure(
     if healthy and not force:
         print("  no changes needed (overlay healthy; durable-router loader present)")
         if has_hop_intent(bindings):
-            print("  bindings: hop intent present; consumer installed")
-        print(f"  prestart: {os.path.join(sand, 'host-prestart-ensure.sh')}")
+            print("  bindings: hop intent present; consumer installed on disk")
+        print(f"  prestart helper: {os.path.join(sand, 'host-prestart-ensure.sh')} (unused unless supervisor wired)")
+        _print_load_path(sand)
         return "noop"
 
     mod = load_patch_mod(patch_py)
@@ -253,7 +277,8 @@ def ensure(
         print(f"  router: {sand_router} ({'present' if os.path.isfile(sand_router) else 'MISSING'})")
         print(f"  would run {patch_py}")
         print("  would node --check FULL host-main (not a wrap slice)")
-        print("  apply path after write: Quit Grok Bot and reopen — NEVER forceNow bounce")
+        print("  would NOT restart host; wrap live only after next host process start")
+        print("  NEVER forceNow bounce")
         return "dry-run"
 
     # Pre-flight: stock host must already parse before we touch it.
@@ -287,7 +312,7 @@ def ensure(
         else:
             print("  [host]   already patched")
 
-        # FULL file — this is the gate that must pass before any reload.
+        # FULL file — this is the gate that must pass before any host start.
         node_check(host_main, "host-main (post-patch FULL)")
         body = read(host_main)
         if not overlay_healthy(body, sand_router):
@@ -302,21 +327,16 @@ def ensure(
             restore()
         die(f"ensure failed, restored backup: {exc!r}")
 
-    prestart = os.path.join(sand, "host-prestart-ensure.sh")
-    print("DONE.")
+    print("DONE (disk).")
     print("  Durable router:", sand_router)
-    print("  Prestart hook: ", prestart)
-    print("  NEXT (safe reload): fully Quit Grok Bot and reopen.")
-    print("  NEVER Update Grok Bot's Computer / forceNow upgrade / adapters restart-host")
-    print("       to apply this patch — those wipe sand-host or crash the fleet.")
-    print("  After an Update Computer *recover*, run ensure (or prestart) again, then Quit/reopen.")
     print("  Hop failure fail-closes to native; unassigned Bots never enter the hop.")
+    _print_load_path(sand)
     return "applied"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Fail-closed brain hop ensure (durable sand-data; no crashy bounce)."
+        description="Fail-closed brain hop ensure (durable sand-data; disk patch only)."
     )
     ap.add_argument("--host-dir", default=os.path.expanduser("~/sand-host"))
     ap.add_argument("--sand", default=os.path.expanduser("~/sand-data"))

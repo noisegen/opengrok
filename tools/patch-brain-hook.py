@@ -13,7 +13,9 @@ Supports TWO stock host shapes (prefer xAI locator when present):
      No xAI branch, no xai-prompt-session.cjs. Wrap that call/return only.
 
   python3 /home/box/sand-data/patch-brain-hook.py
-  Fully Quit Grok Bot and reopen. Do not ./adapters restart-host.
+  Prefer ensure-brain-overlay.py (FULL-file check + restore).
+  Wire load via install-supervisor-prestart.py — desktop Quit does NOT
+  restart host-main. Do not ./adapters restart-host / forceNow / Update Computer.
   grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8
 """
 from __future__ import annotations
@@ -521,9 +523,11 @@ def main() -> None:
     r = subprocess.run(["node", "--check", HOST], capture_output=True, text=True)
     if r.returncode != 0:
         die(f"node --check {HOST} failed:\n{r.stderr}")
-    print("ok")
-    print("next: fully Quit Grok Bot and reopen.")
-    print("NEVER Update Grok Bot's Computer or forceNow upgrade to apply a hop.")
+    print("ok (disk). Prefer: python3 ~/sand-data/ensure-brain-overlay.py")
+    print("Desktop Quit Grok Bot does NOT restart host-main.")
+    print("Wire load: python3 ~/sand-data/install-supervisor-prestart.py")
+    print("Wrap live only after a host process START with wrap already on disk.")
+    print("NEVER Update Computer / forceNow / adapters restart-host to apply.")
     print("then: grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8")
     print("want where=none or where=store — or where=stream if id arrives late")
 

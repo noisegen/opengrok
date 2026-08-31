@@ -129,32 +129,40 @@ tcpdump -i lo port <hop-port>               # expect packets
 
 The `model-bindings.json` + `apply-box-patch.py` path above is Contract A/B for
 openai-hop sessions. The **per-Bot brain hop** (DeepSeek via `brain-router.cjs`)
-is a separate overlay — see `tools/BRAIN-SETUP.txt`. Same survival rule:
+is a separate overlay — see `tools/BRAIN-SETUP.txt`.
 
-| Lives across Computer recover / boot-fetch? | Path |
-|---|---|
-| Yes (durable) | `~/sand-data/brain-bindings.json`, `~/sand-data/brain-router.cjs` (or `~/agent-data/…`), `ensure-brain-overlay.py`, `host-prestart-ensure.sh`, `deepseek.env` |
-| No (rewritten stock) | `~/sand-host/host-main.cjs`, `~/sand-host/brain-router.cjs` |
+### What survives what
 
-After recover / Update Computer / boot-fetch the host is stock again while
-bindings/labels still say DeepSeek. That desync is **F19**.
+| Path | Boot-fetch (sand-host swap) | Update Computer (image recover) |
+|---|---|---|
+| `~/sand-data/*` (bindings, `brain-router.cjs`, ensure, installer) | survives | survives |
+| `/home/box/agent-data` → symlink to sand-data | survives | survives |
+| `~/sand-host/host-main.cjs` wrap | wiped | wiped |
+| `/usr/local/bin/sand-supervisor.mjs` prestart patch | usually kept | **reset from image** |
 
-**Do not** hand-edit the ~25MB `host-main.cjs`. **Do not** apply a hop by
-patching then `forceNow` / `./adapters restart-host` / Update Computer — that
-path twice took down the fleet; Update Computer is recover (boots baked host,
-boot-fetches latest, wipes sand-host), not apply.
+Stock supervisor `launchHost()` hardcodes
+`spawn(process.execPath, [HOST_ENTRY], { cwd: HOST_DIR, env: { … SAND_DATA_ROOT … }})`
+with **no** prestart, box-script, or `NODE_OPTIONS` hook. `SAND_DATA_ROOT` is a
+data-root env name only — stock host-main does not load `brain-router`.
 
-Safe re-apply:
+Desktop **Quit Grok Bot does not restart host-main** (client only). Wrap on
+disk is live only after a host process **start** that already has the wrap.
+
+### Disk patch + load wire
 
 ```bash
-# preferred after boot-fetch: run BEFORE node starts host-main
-~/sand-data/host-prestart-ensure.sh
-
-# or manually (idempotent; no-op when healthy), then Quit Grok Bot and reopen
-python3 ~/sand-data/ensure-brain-overlay.py
-# or from a clone with paths set:
-python3 tools/doctor.py --fix
+python3 ~/sand-data/ensure-brain-overlay.py              # wrap host-main on disk
+python3 ~/sand-data/install-supervisor-prestart.py       # patch launchHost → ensure before spawn
+# wrap goes live on the NEXT host process start through patched launchHost
+# NEVER forceNow / adapters restart-host / Update Computer to apply
 ```
+
+- **Boot-fetch** with supervisor patch kept: launchHost re-runs ensure before
+  spawn → wrap can return automatically.
+- **Update Computer recover:** supervisor is stock again. Hop **cannot
+  auto-restore** the wrap with the current Cursor supervisor (no durable hook
+  between image restore and first spawn). Re-run ensure +
+  `install-supervisor-prestart.py` from sand-data after recover.
 
 `ensure-brain-overlay.py` / `patch-brain-hook.py` support **both** stock shapes
 (prefer xAI locator when present; otherwise Cursor-native):
@@ -176,11 +184,12 @@ Fail-closed rules:
    uses `sand-brain durable-router` loader (fail → native).
 2. **Backup first** — timestamped dir under `sand-data/`.
 3. **FULL-file `node --check`** — never gate on a wrap slice alone (that hid
-   fleet-killing corruption).
+   the leftover-`}` stale-upgrade corruption).
 4. **Restore on failure** — any post-write error restores `host-main`; never
    leave a half patch.
 5. **Runtime** — hop create/key errors log loudly and fall back to native Grok;
    unassigned bots never enter the hop path.
 6. **Keys stay off git** — `~/sand-data/deepseek.env` only (`chmod 600`).
-7. **Reload** — Quit Grok Bot and reopen, or prestart before node — never
-   forceNow bounce to apply.
+7. **Supervisor prestart** — `install-supervisor-prestart.py` inserts ensure
+   before spawn; ensure failure still spawns stock. Update Computer wipes it.
+8. **Never** forceNow / restart-host / Update Computer as the apply path.

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Run BEFORE node starts sand-host/host-main.cjs (after boot-fetch swap).
-# Idempotent. Does NOT bounce the host. Does NOT Update Computer.
+# Disk helper: re-apply host-main wrap from durable sand-data.
+# Does NOT bounce the host. Does NOT Update Computer.
 #
-# Wire this into whatever starts the host after a bundle swap, e.g.:
-#   ~/sand-data/host-prestart-ensure.sh && node ~/sand-host/host-main.cjs
+# Stock /usr/local/bin/sand-supervisor.mjs does NOT call this. Live launchHost()
+# hardcodes spawn(process.execPath, [HOST_ENTRY], …) with no prestart.
+# Wire it with: python3 ~/sand-data/install-supervisor-prestart.py
 #
-# After "Update Grok Bot's Computer" recover, boot-fetch replaces sand-host with
-# stock. Running this before node starts re-applies the tiny fail-closed wrap
-# without a forceNow upgrade bounce (which has taken the fleet down twice).
+# Until that installer has patched launchHost (and after Update Computer, which
+# resets supervisor from the image), running this alone only updates files on
+# disk — the running host-main process is unchanged. Wrap is live only after a
+# host process START that already has the wrap on disk.
 set -euo pipefail
 SAND="${SAND_DATA:-${HOME}/sand-data}"
 if [[ ! -d "$SAND" && -d "${HOME}/agent-data" ]]; then
