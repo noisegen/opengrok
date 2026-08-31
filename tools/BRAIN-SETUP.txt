@@ -43,11 +43,12 @@ Attach (Grok already chats; provider is cursor):
 
   4. Wire supervisor so the NEXT launchHost re-applies before spawn
      (fail-closed: ensure error still spawns stock Grok).
-     Live sand-supervisor.mjs is ESM — installer reuses module-level
-     execFileSync / existsSync / join (no require). Repo ESM fixture tests
-     must be green before using this on a box:
-       python3 ~/sand-data/install-supervisor-prestart.py
-     Patches /usr/local/bin/sand-supervisor.mjs launchHost only.
+     Live sand-supervisor.mjs is ESM root-owned under /usr/local/bin —
+     installer reuses module-level execFileSync/existsSync/join (no require),
+     backs up under sand-data (never a sibling .bak in /usr/local/bin), and
+     re-execs via `sudo -n` with absolute --sand/--tools (sudo sets HOME=/root).
+       python3 /home/box/sand-data/install-supervisor-prestart.py \
+         --sand /home/box/sand-data --tools /home/box/sand-data
      Does not bounce. Does not Update Computer.
 
   5. Wrap becomes live only after a host process start that goes through

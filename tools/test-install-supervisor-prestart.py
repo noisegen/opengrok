@@ -302,6 +302,89 @@ class InstallSupervisorPrestartTests(unittest.TestCase):
         self.assertIn("ESM", blob)
         self.assertRegex(blob, r"(?i)do not.*(forceNow|restart-host|Update Computer)")
 
+    def test_backup_lands_under_sand_not_sibling_when_dir_readonly(self):
+        """Simulate /usr/local/bin: dir not writable → bak cannot be a sibling."""
+        bin_dir = self.root / "usr-local-bin"
+        bin_dir.mkdir()
+        sup = bin_dir / "sand-supervisor.mjs"
+        sup.write_text(STOCK_SUPERVISOR_ESM, encoding="utf-8")
+        os.chmod(sup, 0o644)
+        # Directory not writable: cannot create sibling .bak (live /usr/local/bin).
+        os.chmod(bin_dir, 0o555)
+        try:
+            sibling_probe = bin_dir / "probe-sibling.bak"
+            with self.assertRaises(OSError):
+                sibling_probe.write_text("x", encoding="utf-8")
+
+            buf = StringIO()
+            err = StringIO()
+            with redirect_stdout(buf), redirect_stderr(err):
+                status = self.mod.install(
+                    str(sup),
+                    str(self.sand),
+                    str(HERE),
+                    allow_elevate=False,
+                )
+            self.assertEqual(status, "applied", buf.getvalue() + err.getvalue())
+            out = buf.getvalue()
+            self.assertIn(str(self.sand), out)
+            self.assertIn("brain-overlay-backups-", out)
+            baks = list(self.sand.glob("brain-overlay-backups-*/sand-supervisor.mjs.bak"))
+            self.assertTrue(baks, "expected backup under sand-data")
+            self.assertTrue(baks[0].is_file())
+            rolling = self.sand / "sand-supervisor.mjs.sand-brain-prestart.bak"
+            self.assertTrue(rolling.is_file())
+            siblings = list(bin_dir.glob("sand-supervisor.mjs*bak*"))
+            self.assertEqual(siblings, [], siblings)
+            body = sup.read_text(encoding="utf-8")
+            self.assertIn("/* sand-brain supervisor-prestart */", body)
+            self.assertNotIn("require(", self._prestart_block(body))
+        finally:
+            os.chmod(bin_dir, 0o755)
+
+    def test_unwritable_supervisor_dies_with_permission_fact_without_sudo(self):
+        os.chmod(self.sup, 0o444)
+        try:
+            buf = StringIO()
+            err = StringIO()
+            with redirect_stdout(buf), redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    self.mod.install(
+                        str(self.sup),
+                        str(self.sand),
+                        str(HERE),
+                        allow_elevate=False,
+                    )
+            self.assertEqual(cm.exception.code, 1)
+            blob = buf.getvalue() + err.getvalue()
+            self.assertIn("not writable", blob)
+            self.assertIn("HOME=/root", blob)
+            self.assertIn("/usr/local/bin", blob)
+            self.assertIn("sibling .bak", blob)
+            self.assertNotIn(
+                "/* sand-brain supervisor-prestart */", self.sup.read_text()
+            )
+        finally:
+            os.chmod(self.sup, 0o644)
+
+    def test_sudo_reexec_argv_uses_absolute_sand_tools(self):
+        cmd = self.mod.sudo_reexec_argv(
+            str(HERE / "install-supervisor-prestart.py"),
+            "/usr/local/bin/sand-supervisor.mjs",
+            "~/sand-data",
+            "~/sand-data",
+            dry_run=False,
+        )
+        self.assertEqual(cmd[0], "sudo")
+        self.assertEqual(cmd[1], "-n")
+        self.assertIn("--sand", cmd)
+        sand_val = cmd[cmd.index("--sand") + 1]
+        tools_val = cmd[cmd.index("--tools") + 1]
+        self.assertTrue(os.path.isabs(sand_val), sand_val)
+        self.assertTrue(os.path.isabs(tools_val), tools_val)
+        self.assertNotIn("~", sand_val)
+        self.assertFalse(sand_val.startswith("/root/"))
+
 
 if __name__ == "__main__":
     unittest.main()

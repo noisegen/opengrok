@@ -14,6 +14,10 @@ LIVE FACTS (Grok Bot computer, verified):
   - Desktop "Quit Grok Bot" drops the client only — does NOT restart host-main.
   - host-prestart-ensure.sh alone is UNUSED until something calls it.
   - Update Computer resets supervisor from the image → this patch is wiped.
+  - sand-supervisor.mjs is -rw-r--r-- root root; /usr/local/bin is root-owned.
+    User `box` cannot write the file or create a sibling .bak there. box has
+    passwordless sudo (`sudo -n true`). sudo sets HOME=/root USER=root, so
+    ~/sand-data would become /root/sand-data unless --sand/--tools are absolute.
 
 What this does:
   Insert a fail-closed ensure call immediately before that spawn, using the
@@ -23,6 +27,11 @@ What this does:
   silently no-oping the hop while stock spawn continues. If ensure fails,
   spawn still proceeds (stock Grok lives). Idempotent marker:
   /* sand-brain supervisor-prestart */
+
+  Backups always under --sand (brain-overlay-backups-*), never siblings in
+  /usr/local/bin. If supervisor is not writable, re-exec via `sudo -n` with
+  absolute --sand/--tools (do not rely on HOME). If sudo unavailable, die
+  with that permission fact — never half-patch.
 
 Boot-fetch (sand-host swap only, supervisor binary kept):
   Patched launchHost re-runs ensure before spawn → wrap can come back.
@@ -36,7 +45,9 @@ Update Computer (image recover):
 NEVER: forceNow upgrade, ./adapters restart-host, or Update Computer to apply.
 Keys stay out of git. Unassigned bots never hop (ensure/router rules).
 
-  python3 ~/sand-data/install-supervisor-prestart.py
+  python3 /home/box/sand-data/install-supervisor-prestart.py \\
+    --sand /home/box/sand-data --tools /home/box/sand-data
+  # (auto sudo -n when needed; paths must be absolute under sudo)
 """
 from __future__ import annotations
 
@@ -51,6 +62,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SUPERVISOR = "/usr/local/bin/sand-supervisor.mjs"
 MARKER = "/* sand-brain supervisor-prestart */"
+ELEVATED_ENV = "SAND_BRAIN_SUPERVISOR_AS_ROOT"
 
 # Inserted immediately before the HOST_ENTRY spawn inside launchHost.
 # LIVE supervisor is ESM — top of file already has:
@@ -294,12 +306,97 @@ def sync_installer_to_sand(sand: str, tools_dir: str) -> None:
                 pass
 
 
+def abspath(p: str) -> str:
+    return os.path.abspath(os.path.expanduser(p))
+
+
+def supervisor_writable(path: str) -> bool:
+    """True if this uid can open the supervisor for write (file must exist)."""
+    if not os.path.isfile(path):
+        return False
+    return os.access(path, os.W_OK)
+
+
+def can_sudo_n() -> bool:
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return r.returncode == 0
+
+
+def permission_die(supervisor: str, *, sudo_failed: bool = False) -> None:
+    sudo_bit = (
+        "passwordless sudo unavailable (sudo -n true failed) — refusing to half-patch. "
+        if sudo_failed
+        else "refusing to half-patch without a writable supervisor or sudo elevation. "
+    )
+    die(
+        f"supervisor not writable by uid {os.getuid()}: {supervisor} "
+        f"(live box: -rw-r--r-- 1 root root under /usr/local/bin which box cannot "
+        f"write; /usr/local/bin is drwxr-xr-x root root so box also cannot create "
+        f"a sibling .bak there). {sudo_bit}"
+        f"Re-run with sudo -n and explicit absolute --sand/--tools "
+        f"(sudo sets HOME=/root USER=root, so ~/sand-data would be /root/sand-data)."
+    )
+
+
+def sudo_reexec_argv(
+    script: str,
+    supervisor: str,
+    sand: str,
+    tools_dir: str,
+    dry_run: bool,
+) -> list[str]:
+    """Build sudo -n argv with absolute paths (never rely on HOME under sudo)."""
+    cmd = [
+        "sudo",
+        "-n",
+        sys.executable,
+        abspath(script),
+        "--supervisor",
+        abspath(supervisor),
+        "--sand",
+        abspath(sand),
+        "--tools",
+        abspath(tools_dir),
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+    return cmd
+
+
+def backup_supervisor_under_sand(supervisor: str, sand: str) -> str:
+    """Copy supervisor into sand backups dir — never a sibling under /usr/local/bin."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ")
+    bk_dir = os.path.join(sand, f"brain-overlay-backups-{stamp}")
+    os.makedirs(bk_dir, exist_ok=True)
+    base = os.path.basename(supervisor) or "sand-supervisor.mjs"
+    bk = os.path.join(bk_dir, f"{base}.bak")
+    shutil.copy2(supervisor, bk)
+    # Rolling easy-restore name also under sand (not next to the live binary).
+    rolling = os.path.join(sand, f"{base}.sand-brain-prestart.bak")
+    shutil.copy2(supervisor, rolling)
+    return bk
+
+
 def install(
     supervisor: str,
     sand: str,
     tools_dir: str,
     dry_run: bool = False,
+    allow_elevate: bool = False,
+    script_path: str | None = None,
 ) -> str:
+    supervisor = abspath(supervisor)
+    sand = abspath(sand)
+    tools_dir = abspath(tools_dir)
+
     if not os.path.isfile(supervisor):
         die(
             f"supervisor missing: {supervisor} — run on the Grok Bot computer "
@@ -308,9 +405,13 @@ def install(
 
     print("== install-supervisor-prestart ==")
     print("  target:", supervisor)
+    print("  sand:  ", sand)
     print("  note: live supervisor is ESM — prestart reuses execFileSync/existsSync/join")
+    print("  note: backups go under --sand (never siblings in /usr/local/bin)")
     print("  fail-closed: ensure error → still spawn stock host-main")
     print("  Update Computer resets this file from the image — re-run after recover")
+    if os.environ.get(ELEVATED_ENV) == "1":
+        print(f"  elevated: uid={os.getuid()} (sudo HOME=/root ignored; --sand is absolute)")
 
     sync_installer_to_sand(sand, tools_dir)
     text = read(supervisor)
@@ -328,21 +429,36 @@ def install(
         except SystemExit as exc:
             bindings = f"ESM FAIL (exit {exc.code})"
         m = find_launch_spawn(text)
+        writable = supervisor_writable(supervisor)
         print("== dry-run ==")
         print(f"  bindings: {bindings}")
         print(f"  spawn site: {'FOUND' if m else 'MISSING'}")
+        print(f"  writable: {writable} (uid {os.getuid()})")
+        print("  would backup under", os.path.join(sand, "brain-overlay-backups-*"))
         print("  would insert sand-brain supervisor-prestart before HOST_ENTRY spawn")
         print("  would node --check FULL supervisor after write")
         print("  inserted block must NOT contain require(")
+        if not writable:
+            print("  would re-exec: sudo -n … with absolute --sand/--tools")
         return "dry-run"
 
-    stamp = time.strftime("%Y%m%dT%H%M%SZ")
-    bk = f"{supervisor}.sand-brain-prestart.bak-{stamp}"
-    # Keep one rolling .bak as well for easy restore.
-    bak_simple = supervisor + ".sand-brain-prestart.bak"
-    shutil.copy2(supervisor, bk)
-    if not os.path.isfile(bak_simple):
-        shutil.copy2(supervisor, bak_simple)
+    # Live: root-owned supervisor — elevate before any write attempt.
+    if not supervisor_writable(supervisor):
+        if allow_elevate and os.environ.get(ELEVATED_ENV) != "1":
+            if not can_sudo_n():
+                permission_die(supervisor, sudo_failed=True)
+            script = script_path or os.path.abspath(__file__)
+            cmd = sudo_reexec_argv(script, supervisor, sand, tools_dir, dry_run=False)
+            print("  supervisor not writable by this uid — elevating via sudo -n")
+            print("  ", " ".join(cmd))
+            print("  note: sudo sets HOME=/root — --sand/--tools are absolute paths")
+            env = os.environ.copy()
+            env[ELEVATED_ENV] = "1"
+            r = subprocess.run(cmd, env=env)
+            sys.exit(r.returncode)
+        permission_die(supervisor, sudo_failed=False)
+
+    bk = backup_supervisor_under_sand(supervisor, sand)
     print(f"  backup: {bk}")
 
     wrote = False
@@ -366,8 +482,14 @@ def install(
         raise
     except Exception as exc:
         if wrote:
-            shutil.copy2(bk, supervisor)
-            print(f"  RESTORED supervisor from {bk}", file=sys.stderr)
+            try:
+                shutil.copy2(bk, supervisor)
+                print(f"  RESTORED supervisor from {bk}", file=sys.stderr)
+            except OSError as restore_exc:
+                die(
+                    f"install failed ({exc!r}) and restore also failed ({restore_exc!r}); "
+                    f"manual restore from {bk}"
+                )
         die(f"install failed, restored backup: {exc!r}")
 
     print("DONE.")
@@ -383,7 +505,11 @@ def install(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Patch sand-supervisor launchHost to run ensure before spawn (fail-closed)."
+        description=(
+            "Patch sand-supervisor launchHost to run ensure before spawn (fail-closed). "
+            "Backups under --sand. Elevates via sudo -n with absolute --sand/--tools "
+            "(sudo HOME=/root)."
+        )
     )
     ap.add_argument(
         "--supervisor",
@@ -393,12 +519,26 @@ def main() -> None:
     ap.add_argument("--tools", default=HERE)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    sand = args.sand
+    sand = abspath(args.sand)
     if not os.path.isdir(sand):
-        agent = os.path.expanduser("~/agent-data")
+        agent = abspath("~/agent-data")
         if os.path.isdir(agent):
             sand = agent
-    install(args.supervisor, sand, args.tools, dry_run=args.dry_run)
+    tools = abspath(args.tools)
+    # If invoked without explicit paths as root (sudo), refuse HOME=/root sand.
+    if os.environ.get(ELEVATED_ENV) == "1" and sand.startswith("/root/"):
+        die(
+            f"--sand resolved under /root ({sand}) — sudo sets HOME=/root. "
+            "Pass absolute --sand /home/box/sand-data --tools /home/box/sand-data"
+        )
+    install(
+        abspath(args.supervisor),
+        sand,
+        tools,
+        dry_run=args.dry_run,
+        allow_elevate=True,
+        script_path=os.path.abspath(__file__),
+    )
 
 
 if __name__ == "__main__":
