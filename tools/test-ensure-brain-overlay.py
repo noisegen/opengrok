@@ -500,44 +500,91 @@ class CursorNativePatchTests(unittest.TestCase):
         self.assertFalse((self.host_dir / "brain-router.cjs").exists())
 
     def test_cursor_native_upgrades_stale_overlay_without_id_bag(self):
-        # Simulate the live wrap that was applied before pickSandBrainIds existed.
-        stale = (
-            "// recovered\n"
-            "function createCursorInferencePromptSession(opts) { return opts; }\n"
-            "function createSession(options2, sessionOptions, onRequestId) {\n"
-            "      const requestedModel = 'grok-4.6';\n"
-            "      try {\n"
-            "       /* sand-brain pass-through */\n"
-            '       const { createLazyBrainSession } = require("./brain-router.cjs");\n'
-            "       let cidKey; let getCid;\n"
-            "       try { cidKey = conversationIdKey; } catch (e) {}\n"
-            "       try { getCid = getConversationId; } catch (e) {}\n"
-            "       return createLazyBrainSession({\n"
-            "        requestedModel, onRequestId, sessionOptions,\n"
-            "        conversationIdKey: cidKey, getConversationId: getCid,\n"
-            "        nativeFactory: function (so, rid) {\n"
-            '         const cb = typeof rid === "function" ? rid : onRequestId;\n'
-            "         return createCursorInferencePromptSession({\n"
-            "          getAccessToken: options2.getAccessToken,\n"
-            "          requestedModel,\n"
-            "          onRequestId: cb\n"
-            "         });\n"
-            "        }\n"
-            "       });\n"
-            "      } catch (sandErr) {\n"
-            '       console.error("[sand-brain] overlay failed, native:", sandErr);\n'
-            "       const session = createCursorInferencePromptSession({\n"
-            "        getAccessToken: options2.getAccessToken,\n"
-            "        requestedModel,\n"
-            "        onRequestId\n"
-            "       });\n"
-            "       return session;\n"
-            "      }\n"
-            "}\n"
-        )
+        # LIVE recovered host shape: createCursorSandInference returns an object
+        # with createSession (stale overlay) + sibling shorthand methods.
+        # The only const session = createCursorInferencePromptSession is INSIDE
+        # the catch. Upgrading must replace the whole try/catch — not leave an
+        # extra } before recordPostTurnLabeling (that caused Unexpected '{').
+        stale = r"""
+function createCursorInferencePromptSession(opts) { return { kind: "cursor", opts }; }
+function recordSandPostTurnLabeling() {}
+function getLabelingClient() { return {}; }
+function createCursorSandInference(options2) {
+  return {
+    createSession(onRequestId, sessionOptions) {
+      const requestedModel = "grok-4.6";
+      try {
+       /* sand-brain pass-through */
+       const { createLazyBrainSession } = require("./brain-router.cjs");
+       let cidKey;
+       let getCid;
+       try { cidKey = conversationIdKey; } catch (e) {}
+       try { getCid = getConversationId; } catch (e) {}
+       return createLazyBrainSession({
+        requestedModel,
+        onRequestId,
+        sessionOptions,
+        conversationIdKey: cidKey,
+        getConversationId: getCid,
+        nativeFactory: function (so, rid) {
+         const cb = typeof rid === "function" ? rid : onRequestId;
+         const sessionOptions = so;
+         return createCursorInferencePromptSession({
+          getAccessToken: options2.getAccessToken,
+          getTeamId: options2.getTeamId,
+          getMachineId: options2.getMachineId,
+          requestedModel,
+          onRequestId: cb,
+          ...sessionOptions?.lineage != null ? { lineage: sessionOptions.lineage } : {}
+         });
+        }
+       });
+      } catch (sandErr) {
+       console.error("[sand-brain] overlay failed, native:", sandErr);
+       const session = createCursorInferencePromptSession({
+        getAccessToken: options2.getAccessToken,
+        getTeamId: options2.getTeamId,
+        getMachineId: options2.getMachineId,
+        requestedModel,
+        onRequestId,
+        ...sessionOptions?.lineage != null ? { lineage: sessionOptions.lineage } : {}
+       });
+       return session;
+      }
+    },
+    recordPostTurnLabeling(args) {
+      recordSandPostTurnLabeling(getLabelingClient(), args);
+    },
+    recordFollowupLabeling(args) {
+      recordSandPostTurnLabeling(getLabelingClient(), args);
+    }
+  };
+}
+module.exports = { createCursorSandInference };
+"""
         out = self.pbh.patch(stale)
         self.assertIn("pickSandBrainIds", out)
         self.assertIn("options2:", out)
+        # No leftover brace between catch-end and the sibling method.
+        self.assertRegex(
+            out,
+            r"return session;\s*\n\s*\}\s*\n\s*\},\s*\n\s*recordPostTurnLabeling\(args\)\s*\{",
+        )
+        self.assertNotRegex(
+            out,
+            r"return session;\s*\n\s*\}\s*\n\s*\}\s*\n\s*\},\s*\n\s*recordPostTurnLabeling",
+        )
+        # Must be valid JS (the live failure mode).
+        with tempfile.NamedTemporaryFile("w", suffix=".cjs", delete=False) as tf:
+            tf.write(out)
+            tf_path = tf.name
+        try:
+            r = subprocess.run(
+                ["node", "--check", tf_path], capture_output=True, text=True
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+        finally:
+            os.unlink(tf_path)
         self.assertEqual(out, self.pbh.patch(out))
 
     def test_patch_prefers_xai_when_both_present(self):

@@ -324,13 +324,39 @@ def _build_cursor_overlay(obj_lit: str, indent: str) -> str:
     return "\n".join(indent + ln if ln else indent for ln in lines)
 
 
+def _stale_overlay_span(text: str, abs_try: int, m_call: re.Match) -> tuple[int, int, str, str]:
+    """Span of an existing sand-brain try/catch that must be replaced wholesale.
+
+    LIVE recovered hosts already have a wrap; the only remaining
+    `const session = createCursorInferencePromptSession` sits INSIDE the catch.
+    Replacing only through that call's `return session;` leaves the catch's
+    closing `}` behind and breaks the createCursorSandInference return-object
+    (recordPostTurnLabeling becomes Unexpected '{').
+    """
+    catch_m = re.search(r"catch\s*\(\s*sandErr\s*\)\s*\{", text[abs_try:])
+    if not catch_m:
+        die("stale overlay: missing catch (sandErr) after sand-brain try")
+    catch_open = abs_try + catch_m.end() - 1
+    catch_close = closing_brace(text, catch_open)
+    if catch_close < 0:
+        die("stale overlay: unclosed catch (sandErr)")
+    end = catch_close + 1
+    if not (abs_try <= m_call.start() < end):
+        die("stale overlay: stock createCursorInferencePromptSession call not inside catch")
+    _start, _call_end, obj_lit = _cursor_call_span(text, m_call)
+    # Indent from the outer try line (not the inner const-session line).
+    line_start = text.rfind("\n", 0, abs_try) + 1
+    indent = text[line_start:abs_try]
+    return abs_try, end, obj_lit, indent
+
+
 def patch_cursor_native(text: str) -> str:
     # Fast idempotent path: a current cursor overlay already owns the wrap site.
     for m_try in re.finditer(
         r"try\s*\{\s*/\*\s*sand-brain pass-through\s*\*/",
         text,
     ):
-        window = text[m_try.start() : m_try.start() + 4000]
+        window = text[m_try.start() : m_try.start() + 6000]
         if _is_current_cursor(window) and "const session = createCursorInferencePromptSession" in window:
             return text
 
@@ -343,8 +369,8 @@ def patch_cursor_native(text: str) -> str:
             )
         die("could not find cursor-native createCursorInferencePromptSession call site")
 
-    # Stale sand-brain try immediately before this call → replace from that try.
-    lookback_start = max(0, m_call.start() - 4000)
+    # Stale sand-brain try immediately before this call → replace the whole try/catch.
+    lookback_start = max(0, m_call.start() - 6000)
     lookback = text[lookback_start : m_call.start()]
     abs_try = None
     for m in re.finditer(
@@ -353,16 +379,17 @@ def patch_cursor_native(text: str) -> str:
     ):
         abs_try = lookback_start + m.start()
 
+    if abs_try is not None:
+        start, end, obj_lit, indent = _stale_overlay_span(text, abs_try, m_call)
+        overlay = _build_cursor_overlay(obj_lit, indent)
+        return text[:start] + overlay + text[end:]
+
+    # Fresh stock call: replace from the start of the const-session line
+    # through `return session;` (no surrounding try/catch yet).
     start, end, obj_lit = _cursor_call_span(text, m_call)
     line_start = text.rfind("\n", 0, start) + 1
     indent = text[line_start:start]
     overlay = _build_cursor_overlay(obj_lit, indent)
-
-    if abs_try is not None:
-        # Replace stale overlay (from its try through the stock call in catch).
-        return text[:abs_try] + overlay + text[end:]
-
-    # Fresh stock call: replace from the start of the const-session line.
     return text[:line_start] + overlay + text[end:]
 
 
