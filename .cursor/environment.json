@@ -1,0 +1,11 @@
+{
+  "name": "opengrok",
+  "install": "python3 --version && node --version",
+  "terminals": [
+    {
+      "name": "model-picker",
+      "command": "bash -lc 'BIND=\"$HOME/.opengrok-picker-bindings.json\"; test -f \"$BIND\" || cp examples/model-bindings.example.json \"$BIND\"; exec python3 tools/model-picker.py --bindings \"$BIND\" --port 8766'"
+    }
+  ],
+  "ports": [8766]
+}
