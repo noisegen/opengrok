@@ -174,6 +174,8 @@ def sync_durable(tools_dir: str, sand: str) -> None:
         "ensure-brain-overlay.py",
         "host-prestart-ensure.sh",
         "install-supervisor-prestart.py",
+        "supervisor-boot-fetch.py",
+        "detect-hop-durability.py",
     ):
         src = os.path.join(tools_dir, name)
         dest = os.path.join(sand, name)
@@ -210,9 +212,17 @@ def _print_load_path(sand: str) -> None:
     print("    - Wrap is live only after a host process START with wrap already on disk.")
     print("    - Stock supervisor launchHost has no prestart — wire it with:")
     print(f"        python3 {os.path.join(sand, 'install-supervisor-prestart.py')}")
-    print("    - Boot-fetch (host swap, supervisor kept): patched launchHost re-ensures.")
+    print("    - Host-only bounce: uses in-memory launchHost — wrap returns only if")
+    print("      that supervisor process already has the prestart patch loaded.")
+    print("    - Supervisor recycle when localVersion !== imageSha: boot-fetch is")
+    print("      DISARMED (safe window) — prestart enters memory; launchHost ensure")
+    print("      re-applies wrap without a Cursor bundle fetch. Check with:")
+    print(f"        python3 {os.path.join(sand, 'supervisor-boot-fetch.py')} --check")
+    print("    - Boot-fetch (localVersion === imageSha): sand-host may swap; patched")
+    print("      launchHost re-ensures before spawn if supervisor binary kept.")
     print("    - Update Computer recover: supervisor resets from image — CANNOT auto-restore")
     print("      the wrap; re-run install-supervisor-prestart + ensure after recover.")
+    print("      Optional checklist: python3 ~/sand-data/detect-hop-durability.py")
     print("    - NEVER forceNow / adapters restart-host / Update Computer to apply.")
 
 

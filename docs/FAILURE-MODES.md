@@ -136,14 +136,18 @@ Legend: SYMPTOM (what you see) → CAUSE (what's actually wrong) → LOCK (the f
   3. Load wire: `install-supervisor-prestart.py` patches `launchHost` to run
      ensure **after** boot-fetch swap and **before** spawn (ensure failure
      still spawns stock). Boot-fetch with that patch kept can re-apply the
-     wrap automatically.
+     wrap automatically. **Supervisor recycle** when `sand-host/version` ≠
+     `/etc/sand-box-image-sha` disarms boot-fetch (`shouldBootFetchHostBundle`
+     is false) — safe window to load prestart into memory without a bundle
+     fetch. **Host-only bounce** without supervisor recycle does not load
+     disk-only prestart.
   4. **Update Computer recover cannot auto-restore the wrap** with the current
      supervisor: the image resets `sand-supervisor.mjs`, and nothing durable
      runs between restore and first spawn. After recover re-run ensure +
      `install-supervisor-prestart.py` from sand-data; wrap goes live on the
      next host process start through patched `launchHost` — not via desktop
-     quit. **Never** Update Computer / `./adapters restart-host` / forceNow
-     as the apply path.
+     quit. Optional: `detect-hop-durability.py` from sand-data. **Never**
+     Update Computer / `./adapters restart-host` / forceNow as the apply path.
 
 ---
 

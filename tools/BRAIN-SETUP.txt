@@ -33,6 +33,8 @@ Attach (Grok already chats; provider is cursor):
        tools/ensure-brain-overlay.py          -> ~/sand-data/ensure-brain-overlay.py
        tools/host-prestart-ensure.sh          -> ~/sand-data/host-prestart-ensure.sh
        tools/install-supervisor-prestart.py   -> ~/sand-data/install-supervisor-prestart.py
+       tools/supervisor-boot-fetch.py         -> ~/sand-data/supervisor-boot-fetch.py
+       tools/detect-hop-durability.py         -> ~/sand-data/detect-hop-durability.py
        tools/brain-assign.py                  -> ~/sand-data/brain-assign.py
 
   2. printf 'DEEPSEEK_API_KEY=sk-...\n' > ~/sand-data/deepseek.env
@@ -65,14 +67,36 @@ After boot-fetch (sand-host swapped, supervisor binary KEPT):
   If launchHost was patched, it runs ensure before spawn → wrap can return
   without hand-editing host-main and without forceNow.
 
+Supervisor recycle — SAFE window (2026-09-01 live shape):
+  Upstream: shouldBootFetchHostBundle = (localVersion === imageSha).
+  When ~/sand-host/version != /etc/sand-box-image-sha, boot-fetch is DISARMED.
+  That is the window to recycle the supervisor process so prestart enters
+  memory without Cursor swapping sand-host mid-recycle.
+
+  Check (must exit 0 before recycle):
+    python3 ~/sand-data/supervisor-boot-fetch.py --check
+
+  Apply sequence (no bounce, no Update Computer):
+    python3 ~/sand-data/ensure-brain-overlay.py
+    python3 ~/sand-data/install-supervisor-prestart.py \
+      --sand /home/box/sand-data --tools /home/box/sand-data
+    # supervisor recycle while --check still passes
+    # next launchHost: ensure → wrap on current sand-host/version
+
+  Host-only bounce (supervisor PID unchanged): uses in-memory launchHost only.
+  Disk-only prestart does nothing until supervisor reloads — the overnight hop
+  hole when sand-host swapped without supervisor recycle.
+
 After Update Computer (image recover):
   Supervisor is reset from the image → prestart patch is GONE.
   Durable brain-router + bindings + ensure scripts under sand-data SURVIVE.
   The wrap does NOT auto-come back. With the current Cursor supervisor there
   is no durable automatic hook between image restore and first spawn.
   Honest post-recover sequence (still no bounce as "apply"):
+    python3 ~/sand-data/detect-hop-durability.py
     python3 ~/sand-data/ensure-brain-overlay.py
-    python3 ~/sand-data/install-supervisor-prestart.py
+    python3 ~/sand-data/install-supervisor-prestart.py \
+      --sand /home/box/sand-data --tools /home/box/sand-data
   Then the wrap is on disk + supervisor is wired; it goes live on the next
   host process start through launchHost — not via desktop quit.
 

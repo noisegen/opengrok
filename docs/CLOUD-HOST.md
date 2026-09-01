@@ -171,10 +171,21 @@ python3 /home/box/sand-data/install-supervisor-prestart.py \
 
 - **Boot-fetch** with supervisor patch kept: launchHost re-runs ensure before
   spawn → wrap can return automatically.
+- **Supervisor recycle (safe window):** when `~/sand-host/version` ≠
+  `/etc/sand-box-image-sha`, upstream `shouldBootFetchHostBundle` is false —
+  boot-fetch is **disarmed**. Recycling the supervisor process loads the
+  prestart patch from disk into memory without swapping sand-host. This is
+  the intended apply path after `install-supervisor-prestart.py`:
+  `python3 ~/sand-data/supervisor-boot-fetch.py --check` must exit 0 first.
+- **Host-only bounce** (supervisor PID unchanged): only helps if that process
+  already had prestart in memory. Disk-only prestart is inert until supervisor
+  reloads — the overnight hop hole when Cursor swapped sand-host without a
+  supervisor recycle.
 - **Update Computer recover:** supervisor is stock again. Hop **cannot
   auto-restore** the wrap with the current Cursor supervisor (no durable hook
   between image restore and first spawn). Re-run ensure +
-  `install-supervisor-prestart.py` from sand-data after recover.
+  `install-supervisor-prestart.py` from sand-data after recover. Optional:
+  `python3 ~/sand-data/detect-hop-durability.py` for a post-recover checklist.
 
 `ensure-brain-overlay.py` / `patch-brain-hook.py` support **both** stock shapes
 (prefer xAI locator when present; otherwise Cursor-native):

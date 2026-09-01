@@ -335,6 +335,84 @@ class InstallSupervisorPrestartTests(unittest.TestCase):
         self.assertTrue(marker.is_file(), "spawn did not reach fake host")
         self.assertIn("missing", proc.stderr + proc.stdout)
 
+    def test_prestart_immediately_before_spawn_calls_durable_ensure(self):
+        """Prestart must sit directly before spawn(HOST_ENTRY) and call sand-data ensure."""
+        status, out, _ = self._run()
+        self.assertEqual(status, "applied", out)
+        body = self.sup.read_text(encoding="utf-8")
+        marker = "/* sand-brain supervisor-prestart */"
+        spawn = "spawn(process.execPath, [HOST_ENTRY]"
+        marker_at = body.index(marker)
+        spawn_at = body.index(spawn)
+        self.assertLess(marker_at, spawn_at, "prestart marker must precede HOST_ENTRY spawn")
+        block = body[marker_at:spawn_at]
+        # Durable ensure path with absolute sand/tools args (no require).
+        self.assertIn("ensure-brain-overlay.py", block)
+        self.assertIn("existsSync(ensurePy)", block)
+        self.assertIn('execFileSync(', block)
+        self.assertIn('"--host-dir"', block)
+        self.assertIn('"--sand"', block)
+        self.assertIn('"--tools"', block)
+        self.assertIn("join(sandRoot", block)
+        self.assertIn("continuing stock spawn", block)
+        self.assertNotIn("require(", block)
+        # Catch must complete before spawn (fail-closed).
+        catch_end = body.rfind("}", marker_at, spawn_at)
+        self.assertGreater(catch_end, marker_at)
+        between = body[catch_end:spawn_at]
+        self.assertNotIn("throw ", between)
+
+    def test_runtime_ensure_runs_before_spawn(self):
+        """When ensure exists, launchHost execFileSync's it before reaching spawn."""
+        fake_host = self.root / "fake-host3.mjs"
+        spawn_marker = self.root / "spawned3.flag"
+        ensure_marker = self.root / "ensure-ran.flag"
+        fake_host.write_text(
+            "import { writeFileSync } from 'node:fs';\n"
+            f"writeFileSync({str(spawn_marker)!r}, 'spawn');\n",
+            encoding="utf-8",
+        )
+        sand = self.root / "sand-runtime"
+        sand.mkdir()
+        # Minimal ensure stub — records it ran with expected argv shape.
+        (sand / "ensure-brain-overlay.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "args = dict(zip(sys.argv[1::2], sys.argv[2::2]))\n"
+            f"Path({str(ensure_marker)!r}).write_text(repr(args), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        self.sup.write_text(
+            make_harness_supervisor(fake_host, sand), encoding="utf-8"
+        )
+        status, out, _ = self._run()
+        self.assertEqual(status, "applied", out)
+        runner = self.root / "run-launch3.mjs"
+        runner.write_text(
+            f"import {{ launchHost }} from {self.sup.as_uri()!r};\n"
+            "const child = launchHost();\n"
+            "await new Promise((r) => child.once('exit', r));\n"
+            "if (child.exitCode !== 0) process.exit(child.exitCode || 1);\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["SAND_DATA_ROOT"] = str(sand)
+        proc = subprocess.run(
+            ["node", str(runner)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(ensure_marker.is_file(), "ensure must run before spawn")
+        self.assertTrue(spawn_marker.is_file(), "spawn must still run (fail-closed)")
+        ensure_args = ensure_marker.read_text(encoding="utf-8")
+        self.assertIn("--sand", ensure_args)
+        self.assertIn("--tools", ensure_args)
+        self.assertIn("--host-dir", ensure_args)
+
     def test_messaging_forbids_bounce_and_states_update_computer_limit(self):
         status, out, err = self._run()
         self.assertEqual(status, "applied", out)

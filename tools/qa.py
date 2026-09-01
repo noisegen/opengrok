@@ -98,6 +98,7 @@ for name in (
     "test-brain-assign.py",
     "test-ensure-brain-overlay.py",
     "test-install-supervisor-prestart.py",
+    "test-supervisor-boot-fetch.py",
 ):
     r = subprocess.run([sys.executable, str(HERE / "tools" / name)], capture_output=True, text=True)
     if r.returncode:

@@ -36,6 +36,10 @@ What this does:
 Boot-fetch (sand-host swap only, supervisor binary kept):
   Patched launchHost re-runs ensure before spawn → wrap can come back.
 
+Supervisor recycle when localVersion !== imageSha (shouldBootFetchHostBundle false):
+  Boot-fetch is DISARMED — safe window to load prestart into memory without
+  sand-host swap. Check: python3 ~/sand-data/supervisor-boot-fetch.py --check
+
 Update Computer (image recover):
   Supervisor is stock again. This hop CANNOT auto-restore the wrap until
   someone re-runs this installer from durable ~/sand-data AFTER recover.
@@ -340,6 +344,8 @@ def sync_installer_to_sand(sand: str, tools_dir: str) -> None:
         "host-prestart-ensure.sh",
         "patch-brain-hook.py",
         "brain-router.cjs",
+        "supervisor-boot-fetch.py",
+        "detect-hop-durability.py",
     ):
         src = os.path.join(tools_dir, name)
         dest = os.path.join(sand, name)
