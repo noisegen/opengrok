@@ -37,6 +37,7 @@ const {
   logLine,
   LOG,
   toChatMessages,
+  sanitizeToolCallPairs,
   hasChatPayload,
   makeHopStreamResult,
   failClosedStreamResult,
@@ -658,6 +659,110 @@ assert.ok(hopBody.messages.some((m) => m.role === "user"));
   assert.strictEqual(toolPair[1].tool_call_id, "call_1");
   assert.ok(!String(toolPair[0].content || "").includes("tool-call"));
   assert.strictEqual(hasChatPayload(toolPair), true);
+
+  // tool-call without tool-result → no dangling tool_calls (DeepSeek 400).
+  const missingResult = toChatMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "orphan_1", toolName: "grep", args: { q: "x" } },
+      ],
+    },
+    { role: "user", content: "testing" },
+  ]);
+  assert.strictEqual(missingResult.length, 1);
+  assert.strictEqual(missingResult[0].role, "user");
+  assert.ok(!missingResult.some((m) => Array.isArray(m.tool_calls) && m.tool_calls.length));
+
+  // Partial pairing: two tool_calls, one tool-result → keep only matched pair.
+  const partialPair = toChatMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "tc_a", toolName: "read", args: {} },
+        { type: "tool-call", toolCallId: "tc_b", toolName: "grep", args: {} },
+      ],
+    },
+    {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "tc_a", result: "file contents" }],
+    },
+    { role: "user", content: "continue" },
+  ]);
+  assert.strictEqual(partialPair.length, 3);
+  assert.strictEqual(partialPair[0].role, "assistant");
+  assert.strictEqual(partialPair[0].tool_calls.length, 1);
+  assert.strictEqual(partialPair[0].tool_calls[0].id, "tc_a");
+  assert.strictEqual(partialPair[1].role, "tool");
+  assert.strictEqual(partialPair[1].tool_call_id, "tc_a");
+  assert.strictEqual(partialPair[2].role, "user");
+
+  // Long Grok-style thread: several tool turns, no unpaired tool_calls at end.
+  const longThread = toChatMessages([
+    { role: "user", content: "find the router" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "I'll search." },
+        { type: "tool-call", toolCallId: "call_1", toolName: "glob", args: { p: "**/*" } },
+      ],
+    },
+    {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "call_1", result: ["a.cjs"] }],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Found a.cjs" }],
+    },
+    { role: "user", content: "read it" },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "call_2", toolName: "read", args: { path: "a.cjs" } },
+        { type: "tool-call", toolCallId: "call_3", toolName: "grep", args: { q: "hop" } },
+      ],
+    },
+    {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "call_2", result: "contents" }],
+    },
+    // call_3 result missing (harness dropped id) — must not leave dangling call_3.
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Partial results." }],
+    },
+    { role: "user", content: "testing" },
+  ]);
+  for (let ti = 0; ti < longThread.length; ti++) {
+    const msg = longThread[ti];
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+      const ids = new Set(msg.tool_calls.map((tc) => tc.id));
+      let tj = ti + 1;
+      const seen = new Set();
+      while (tj < longThread.length && longThread[tj].role === "tool") {
+        seen.add(longThread[tj].tool_call_id);
+        tj++;
+      }
+      for (const id of ids) {
+        assert.ok(seen.has(id), "unpaired tool_call id " + id + " at index " + ti);
+      }
+      assert.strictEqual(
+        seen.size,
+        ids.size,
+        "tool message count must match tool_calls at index " + ti
+      );
+    }
+  }
+  assert.ok(longThread.some((m) => m.role === "user" && m.content === "testing"));
+  assert.ok(
+    !longThread.some(
+      (m) =>
+        m.role === "assistant" &&
+        Array.isArray(m.tool_calls) &&
+        m.tool_calls.some((tc) => tc.id === "call_3")
+    )
+  );
 }
 
 // makeHopStreamResult shape (not a Promise)

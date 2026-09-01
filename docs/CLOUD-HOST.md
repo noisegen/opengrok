@@ -181,6 +181,9 @@ python3 /home/box/sand-data/install-supervisor-prestart.py \
   already had prestart in memory. Disk-only prestart is inert until supervisor
   reloads — the overnight hop hole when Cursor swapped sand-host without a
   supervisor recycle.
+- **Supervisor process killed/restarted** (not just host-main): image supervisor
+  returns (stock, no prestart); boot-fetch may run — re-run installer from
+  sand-data. Do not use Update Computer as apply path.
 - **Update Computer recover:** supervisor is stock again. Hop **cannot
   auto-restore** the wrap with the current Cursor supervisor (no durable hook
   between image restore and first spawn). Re-run ensure +

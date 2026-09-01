@@ -40,6 +40,10 @@ Supervisor recycle when localVersion !== imageSha (shouldBootFetchHostBundle fal
   Boot-fetch is DISARMED — safe window to load prestart into memory without
   sand-host swap. Check: python3 ~/sand-data/supervisor-boot-fetch.py --check
 
+If sand-supervisor itself is killed/restarted (not just host-main): the image
+supervisor returns (stock, no prestart) and boot-fetch may run again — same
+limits as Update Computer for the prestart wire; re-run installer from sand-data.
+
 Update Computer (image recover):
   Supervisor is stock again. This hop CANNOT auto-restore the wrap until
   someone re-runs this installer from durable ~/sand-data AFTER recover.

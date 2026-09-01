@@ -455,6 +455,62 @@ function stringifyArgs(args) {
 }
 
 /**
+ * DeepSeek/OpenAI require every assistant tool_calls id to have an immediate
+ * following role:tool message. Drop unmatched tool_calls (prefer over empty synth).
+ */
+function sanitizeToolCallPairs(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+  let i = 0;
+  while (i < list.length) {
+    const m = list[i];
+    if (!m || typeof m !== "object") {
+      i++;
+      continue;
+    }
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const following = [];
+      let j = i + 1;
+      while (j < list.length && list[j] && list[j].role === "tool") {
+        following.push(list[j]);
+        j++;
+      }
+      const toolById = new Map();
+      for (const t of following) {
+        const id = t.tool_call_id || t.toolCallId;
+        if (id) toolById.set(String(id), t);
+      }
+      const keptCalls = m.tool_calls.filter((tc) => tc && toolById.has(String(tc.id)));
+      if (keptCalls.length) {
+        const keptIds = new Set(keptCalls.map((tc) => String(tc.id)));
+        const msg = {
+          role: "assistant",
+          content: m.content != null ? m.content : null,
+          tool_calls: keptCalls,
+        };
+        out.push(msg);
+        for (const t of following) {
+          const id = String(t.tool_call_id || t.toolCallId || "");
+          if (keptIds.has(id)) out.push(t);
+        }
+      } else if (typeof m.content === "string" && m.content.trim()) {
+        out.push({ role: "assistant", content: m.content });
+      }
+      i = j;
+      continue;
+    }
+    if (m.role === "tool") {
+      // Orphan tool (no preceding assistant tool_calls block) — skip.
+      i++;
+      continue;
+    }
+    out.push(m);
+    i++;
+  }
+  return out;
+}
+
+/**
  * Convert AI-SDK / Grok core messages to OpenAI chat.completions messages.
  * Preserves assistant tool_calls before role:tool (DeepSeek 400 otherwise).
  * Never JSON.stringifies whole part arrays into content.
@@ -591,7 +647,7 @@ function toChatMessages(list) {
 
     // Skip unknown non-string content (do not dump objects into content).
   }
-  return out;
+  return sanitizeToolCallPairs(out);
 }
 
 function hasChatPayload(messages) {
@@ -1187,6 +1243,7 @@ module.exports = {
   createDeepseekHopSession,
   loadHopKey,
   toChatMessages,
+  sanitizeToolCallPairs,
   hasChatPayload,
   makeHopStreamResult,
   failClosedStreamResult,
