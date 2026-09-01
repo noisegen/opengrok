@@ -961,6 +961,28 @@ function failClosedStreamResult(hopResult, origStream, args) {
   return hopResult;
 }
 
+/**
+ * Hop executor surface expected by host-main (SimplePromptToolExecutor /
+ * RedactedPromptToolExecutor): getState, getMessages, clearMessages, appendMessages, stream.
+ */
+function buildHopExecutor(messages, streamFn) {
+  return {
+    getState() {
+      return Array.isArray(messages) ? messages.slice() : [];
+    },
+    getMessages() {
+      return messages;
+    },
+    clearMessages() {
+      messages = [];
+    },
+    appendMessages(next) {
+      if (Array.isArray(next)) messages = messages.concat(next);
+    },
+    stream: streamFn,
+  };
+}
+
 function createDeepseekHopSession(brain, opts) {
   const key = loadHopKey(brain);
   if (!key) {
@@ -992,17 +1014,7 @@ function createDeepseekHopSession(brain, opts) {
             ? initialMessages.slice()
             : [];
       messages = seeded;
-      return {
-        getMessages() {
-          return messages;
-        },
-        clearMessages() {
-          messages = [];
-        },
-        appendMessages(next) {
-          if (Array.isArray(next)) messages = messages.concat(next);
-        },
-        stream: function () {
+      return buildHopExecutor(messages, function () {
           const chatMessages = toChatMessages(messages);
           if (!hasChatPayload(chatMessages)) {
             logLine("hop empty messages -> fail-closed");
@@ -1038,8 +1050,7 @@ function createDeepseekHopSession(brain, opts) {
             return { text: (msg && msg.content) || "", modelId: model };
           })();
           return makeHopStreamResult(inner, model);
-        },
-      };
+      });
     },
   };
 }
@@ -1386,6 +1397,7 @@ module.exports = {
   makeHopStreamResult,
   failClosedStreamResult,
   completeStreamResult,
+  buildHopExecutor,
   SKIPPED_TOOL_STUB,
   STOCK_PROVIDERS,
   LIVE_BRAINS,

@@ -648,6 +648,18 @@ const hopEx = hopSess.getExecutor([
 ]);
 assert.ok(hopEx.getMessages().some((m) => String(m.content).includes("[sand-brain]")));
 assert.ok(hopEx.getMessages().some((m) => m.role === "user" && m.content.includes("sacred geometry")));
+assert.strictEqual(typeof hopEx.getState, "function");
+const hopState = hopEx.getState();
+assert.ok(Array.isArray(hopState));
+assert.ok(hopState.some((m) => m.role === "user" && m.content.includes("sacred geometry")));
+hopState.push({ role: "user", content: "mutated-copy" });
+assert.ok(!hopEx.getMessages().some((m) => m.content === "mutated-copy"));
+// host-main SimplePromptToolExecutor / RedactedPromptToolExecutor pattern.
+const fakeToolMiddleware = { innerExecutor: hopEx };
+assert.doesNotThrow(() => {
+  const s = fakeToolMiddleware.innerExecutor.getState();
+  assert.ok(Array.isArray(s));
+});
 const hopResult = hopEx.stream();
 // Bug 2: must be sync stream-result object, NOT a Promise.
 assert.strictEqual(typeof hopResult.then, "undefined");
