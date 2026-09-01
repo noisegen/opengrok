@@ -41,8 +41,28 @@ const {
   hasChatPayload,
   makeHopStreamResult,
   failClosedStreamResult,
+  completeStreamResult,
   SKIPPED_TOOL_STUB,
 } = require("./brain-router.cjs");
+
+// Mirrors live host-main summarization / self-summary / tool stream wrapper.
+function hostMainAttachStreamCatchHandlers(result) {
+  result.extendedUsage.catch(() => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  }));
+  result.usage.catch(() => ({
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+  }));
+  result.providerMetadata.catch(() => undefined);
+  result.invocationId.catch(() => undefined);
+  result.response.catch(() => ({ modelId: "fallback" }));
+}
 
 function assertToolCallAdjacency(messages, label) {
   for (let i = 0; i < messages.length; i++) {
@@ -635,6 +655,9 @@ assert.ok(hopResult.fullStream);
 assert.ok(hopResult.response);
 assert.ok(hopResult.usage);
 assert.ok(hopResult.extendedUsage);
+assert.ok(typeof hopResult.providerMetadata.catch === "function");
+assert.ok(typeof hopResult.invocationId.catch === "function");
+hostMainAttachStreamCatchHandlers(hopResult);
 assert.ok(hopUrl.indexOf("https://api.deepseek.com/v1/chat/completions") === 0);
 assert.ok(hopAuth.indexOf("Bearer sk-test") === 0);
 assert.ok(Array.isArray(hopBody.messages));
@@ -787,12 +810,48 @@ assert.ok(hopBody.messages.some((m) => m.role === "user"));
   assert.strictEqual(call3Tool.content, SKIPPED_TOOL_STUB);
 }
 
-// makeHopStreamResult shape (not a Promise)
+// makeHopStreamResult shape (not a Promise; all host-main .catch fields present)
 {
   const shaped = makeHopStreamResult(Promise.resolve({ text: "hi" }), "deepseek-v4-flash");
   assert.strictEqual(typeof shaped.then, "undefined");
   assert.ok(shaped.fullStream);
   assert.ok(typeof shaped.response.then === "function");
+  assert.ok(typeof shaped.usage.catch === "function");
+  assert.ok(typeof shaped.extendedUsage.catch === "function");
+  assert.ok(typeof shaped.providerMetadata.catch === "function");
+  assert.ok(typeof shaped.invocationId.catch === "function");
+  hostMainAttachStreamCatchHandlers(shaped);
+
+  // failClosed completes native fallback missing providerMetadata / invocationId.
+  const wrapped = failClosedStreamResult(
+    shaped,
+    function () {
+      return {
+        fullStream: (async function* () {})(),
+        response: Promise.resolve({ modelId: "n" }),
+        usage: Promise.resolve({ totalTokens: 0, promptTokens: 0, completionTokens: 0 }),
+        extendedUsage: Promise.resolve({
+          inputTokens: 0,
+          outputTokens: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+        }),
+      };
+    },
+    []
+  );
+  assert.ok(typeof wrapped.providerMetadata.catch === "function");
+  assert.ok(typeof wrapped.invocationId.catch === "function");
+  hostMainAttachStreamCatchHandlers(wrapped);
+
+  const completed = completeStreamResult({
+    fullStream: (async function* () {})(),
+    response: Promise.resolve({ modelId: "x" }),
+  });
+  assert.ok(typeof completed.providerMetadata.catch === "function");
+  assert.ok(typeof completed.invocationId.catch === "function");
+  hostMainAttachStreamCatchHandlers(completed);
 }
 
 function nativeStreamSession(marker) {
@@ -846,6 +905,7 @@ function nativeStreamSession(marker) {
   const r200 = ex200.stream({}, "inv-200", []);
   assert.strictEqual(typeof r200.then, "undefined");
   assert.ok(r200.response && r200.fullStream);
+  hostMainAttachStreamCatchHandlers(r200);
   const resp200 = await r200.response;
   assert.ok(typeof resp200.modelId.trim() === "string" && resp200.modelId.trim());
   const parts200 = [];
@@ -887,6 +947,7 @@ function nativeStreamSession(marker) {
   const r400 = ex400.stream({}, "inv-400", []);
   assert.strictEqual(typeof r400.then, "undefined");
   assert.ok(r400.response);
+  hostMainAttachStreamCatchHandlers(r400);
   const [response2, usage2] = await Promise.all([r400.response, r400.extendedUsage]);
   assert.ok(response2 && typeof response2.modelId === "string");
   assert.strictEqual(response2.modelId.trim(), "grok-native");
@@ -934,6 +995,8 @@ function nativeStreamSession(marker) {
   );
   assert.strictEqual(typeof nativeSync.then, "undefined");
   assert.ok(nativeSync.response);
+  assert.ok(typeof nativeSync.providerMetadata.catch === "function");
+  hostMainAttachStreamCatchHandlers(nativeSync);
   const nr = await nativeSync.response;
   assert.strictEqual(nr.modelId, "n");
 

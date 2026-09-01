@@ -758,23 +758,93 @@ async function readHopHttpError(res) {
 }
 
 /**
+ * Native host-main (~506623 summarization, ~533368 self-summary, ~580052 tool
+ * stream wrapper) calls .catch on response, usage, extendedUsage,
+ * providerMetadata, and invocationId. Missing fields → undefined.catch crash.
+ */
+function completeStreamResult(partial) {
+  if (!partial || typeof partial !== "object" || typeof partial.then === "function") {
+    return partial;
+  }
+  if (!partial.fullStream && partial.response == null) return partial;
+
+  function asPromise(v, fallback) {
+    if (v != null && typeof v.then === "function") return v;
+    return Promise.resolve(v !== undefined ? v : fallback());
+  }
+
+  const response = asPromise(partial.response, () => ({ modelId: "unknown" }));
+  const usage = asPromise(partial.usage, () => ({
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+  }));
+  const extendedUsage = asPromise(partial.extendedUsage, () => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  }));
+  const providerMetadata = asPromise(partial.providerMetadata, () => undefined);
+  const invocationId = asPromise(partial.invocationId, () => undefined);
+
+  response.catch(() => {});
+  usage.catch(() => {});
+  extendedUsage.catch(() => {});
+  providerMetadata.catch(() => {});
+  invocationId.catch(() => {});
+
+  return {
+    fullStream: partial.fullStream,
+    response,
+    usage,
+    extendedUsage,
+    providerMetadata,
+    invocationId,
+  };
+}
+
+async function resolveStreamField(result, key, fallback) {
+  if (!result || typeof result !== "object") return fallback();
+  const v = result[key];
+  if (v == null) return fallback();
+  return typeof v.then === "function" ? await v : v;
+}
+
+/**
  * Native executor.stream() returns a stream-result OBJECT synchronously
- * (fullStream / response / usage / extendedUsage). Returning a Promise
- * makes UsageSanitizingMiddleware read undefined.modelId and kill inference.
+ * (fullStream / response / usage / extendedUsage / providerMetadata /
+ * invocationId). Returning a Promise makes UsageSanitizingMiddleware read
+ * undefined.modelId and kill inference.
  */
 function makeHopStreamResult(innerPromise, model) {
   const modelId = String(model || "deepseek-v4-flash");
   const inner = Promise.resolve(innerPromise);
   const response = inner.then(() => ({ modelId }));
-  const usage = inner.then(() => ({ promptTokens: 0, completionTokens: 0 }));
-  const extendedUsage = inner.then(() => ({ promptTokens: 0, completionTokens: 0 }));
+  const usage = inner.then(() => ({
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+  }));
+  const extendedUsage = inner.then(() => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  }));
+  const providerMetadata = inner.then(() => undefined);
+  const invocationId = inner.then(() => undefined);
   // Derived promises reject when hop fails; swallow until failClosed / caller attaches.
   inner.catch(() => {});
   response.catch(() => {});
   usage.catch(() => {});
   extendedUsage.catch(() => {});
+  providerMetadata.catch(() => {});
+  invocationId.catch(() => {});
 
-  return {
+  return completeStreamResult({
     fullStream: (async function* () {
       const data = await inner;
       const text = (data && data.text) || "";
@@ -785,25 +855,24 @@ function makeHopStreamResult(innerPromise, model) {
     response,
     usage,
     extendedUsage,
-  };
+    providerMetadata,
+    invocationId,
+  });
 }
 
 function rejectHopStreamResult(err, model) {
-  const modelId = String(model || "deepseek-v4-flash");
   const rejected = Promise.reject(err);
-  const response = rejected;
-  const usage = rejected;
-  const extendedUsage = rejected;
   rejected.catch(() => {});
-  return {
+  return completeStreamResult({
     fullStream: (async function* () {
       await rejected;
     })(),
-    response,
-    usage,
-    extendedUsage,
-    modelId,
-  };
+    response: rejected,
+    usage: rejected,
+    extendedUsage: rejected,
+    providerMetadata: rejected,
+    invocationId: rejected,
+  });
 }
 
 /**
@@ -822,7 +891,7 @@ function failClosedStreamResult(hopResult, origStream, args) {
       /* ignore */
     }
     logLine("hop stream not a stream-result -> native");
-    return origStream.apply(null, args);
+    return completeStreamResult(origStream.apply(null, args));
   }
 
   // Proper stream-result: wrap so async HTTP/empty rejection uses native.
@@ -842,6 +911,8 @@ function failClosedStreamResult(hopResult, origStream, args) {
     Promise.resolve(hopResult.response).catch(() => {});
     Promise.resolve(hopResult.usage).catch(() => {});
     Promise.resolve(hopResult.extendedUsage).catch(() => {});
+    Promise.resolve(hopResult.providerMetadata).catch(() => {});
+    Promise.resolve(hopResult.invocationId).catch(() => {});
 
     const decided = Promise.resolve(hopResult.response).then(
       () => ({ kind: "hop", result: hopResult }),
@@ -851,37 +922,39 @@ function failClosedStreamResult(hopResult, origStream, args) {
       }
     );
 
-    return {
+    return completeStreamResult({
       fullStream: (async function* () {
         const d = await decided;
         const r = d.result;
         if (!r || typeof r !== "object" || !r.fullStream) return;
         for await (const ev of r.fullStream) yield ev;
       })(),
-      response: decided.then(async (d) => {
-        const r = d.result;
-        if (r && typeof r === "object" && r.response != null) {
-          return typeof r.response.then === "function" ? await r.response : r.response;
-        }
-        return { modelId: "native" };
-      }),
-      usage: decided.then(async (d) => {
-        const r = d.result;
-        if (r && typeof r === "object" && r.usage != null) {
-          return typeof r.usage.then === "function" ? await r.usage : r.usage;
-        }
-        return { promptTokens: 0, completionTokens: 0 };
-      }),
-      extendedUsage: decided.then(async (d) => {
-        const r = d.result;
-        if (r && typeof r === "object" && r.extendedUsage != null) {
-          return typeof r.extendedUsage.then === "function"
-            ? await r.extendedUsage
-            : r.extendedUsage;
-        }
-        return { promptTokens: 0, completionTokens: 0 };
-      }),
-    };
+      response: decided.then((d) =>
+        resolveStreamField(d.result, "response", () => ({ modelId: "native" }))
+      ),
+      usage: decided.then((d) =>
+        resolveStreamField(d.result, "usage", () => ({
+          totalTokens: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+        }))
+      ),
+      extendedUsage: decided.then((d) =>
+        resolveStreamField(d.result, "extendedUsage", () => ({
+          inputTokens: 0,
+          outputTokens: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+        }))
+      ),
+      providerMetadata: decided.then((d) =>
+        resolveStreamField(d.result, "providerMetadata", () => undefined)
+      ),
+      invocationId: decided.then((d) =>
+        resolveStreamField(d.result, "invocationId", () => undefined)
+      ),
+    });
   }
 
   // Opaque sync hop return (string / custom) — pass through unchanged.
@@ -1312,6 +1385,7 @@ module.exports = {
   hasChatPayload,
   makeHopStreamResult,
   failClosedStreamResult,
+  completeStreamResult,
   SKIPPED_TOOL_STUB,
   STOCK_PROVIDERS,
   LIVE_BRAINS,
