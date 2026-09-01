@@ -41,7 +41,27 @@ const {
   hasChatPayload,
   makeHopStreamResult,
   failClosedStreamResult,
+  SKIPPED_TOOL_STUB,
 } = require("./brain-router.cjs");
+
+function assertToolCallAdjacency(messages, label) {
+  for (let i = 0; i < messages.length; i++) {
+    const mm = messages[i];
+    if (!mm || !Array.isArray(mm.tool_calls) || !mm.tool_calls.length) continue;
+    const need = mm.tool_calls.map((t) => t.id);
+    const got = [];
+    let j = i + 1;
+    while (j < messages.length && messages[j] && messages[j].role === "tool") {
+      got.push(messages[j].tool_call_id);
+      j++;
+    }
+    assert.deepStrictEqual(
+      got,
+      need,
+      (label || "adjacency") + " tool_calls " + JSON.stringify(need) + " got " + JSON.stringify(got)
+    );
+  }
+}
 
 assert.strictEqual(
   shouldUseDeepseek({ conversationId: "71b408bd-0c94-494b-8a45-754bc0ef2d73" }),
@@ -659,45 +679,70 @@ assert.ok(hopBody.messages.some((m) => m.role === "user"));
   assert.strictEqual(toolPair[1].tool_call_id, "call_1");
   assert.ok(!String(toolPair[0].content || "").includes("tool-call"));
   assert.strictEqual(hasChatPayload(toolPair), true);
+  assertToolCallAdjacency(toolPair, "happy path");
 
-  // tool-call without tool-result → no dangling tool_calls (DeepSeek 400).
-  const missingResult = toChatMessages([
+  // Reject/skip: no tool-result → stub, adjacency holds (UltraCode-Shim #3).
+  const rejectSkip = toChatMessages([
     {
       role: "assistant",
       content: [
-        { type: "tool-call", toolCallId: "orphan_1", toolName: "grep", args: { q: "x" } },
+        { type: "tool-call", toolCallId: "call_1", toolName: "grep", args: { q: "x" } },
       ],
     },
-    { role: "user", content: "testing" },
+    { role: "user", content: "nah, do it differently" },
   ]);
-  assert.strictEqual(missingResult.length, 1);
-  assert.strictEqual(missingResult[0].role, "user");
-  assert.ok(!missingResult.some((m) => Array.isArray(m.tool_calls) && m.tool_calls.length));
+  assertToolCallAdjacency(rejectSkip, "reject skip");
+  assert.strictEqual(rejectSkip.length, 3);
+  assert.strictEqual(rejectSkip[0].role, "assistant");
+  assert.strictEqual(rejectSkip[1].role, "tool");
+  assert.strictEqual(rejectSkip[1].tool_call_id, "call_1");
+  assert.strictEqual(rejectSkip[1].content, SKIPPED_TOOL_STUB);
+  assert.strictEqual(rejectSkip[2].role, "user");
+  assert.strictEqual(rejectSkip[2].content, "nah, do it differently");
 
-  // Partial pairing: two tool_calls, one tool-result → keep only matched pair.
+  // Partial parallel: call_1 result, call_2 missing → stub on call_2.
   const partialPair = toChatMessages([
     {
       role: "assistant",
       content: [
-        { type: "tool-call", toolCallId: "tc_a", toolName: "read", args: {} },
-        { type: "tool-call", toolCallId: "tc_b", toolName: "grep", args: {} },
+        { type: "tool-call", toolCallId: "call_1", toolName: "read", args: {} },
+        { type: "tool-call", toolCallId: "call_2", toolName: "grep", args: {} },
       ],
     },
     {
-      role: "tool",
-      content: [{ type: "tool-result", toolCallId: "tc_a", result: "file contents" }],
+      role: "user",
+      content: [{ type: "tool-result", toolCallId: "call_1", result: "done" }],
     },
-    { role: "user", content: "continue" },
   ]);
-  assert.strictEqual(partialPair.length, 3);
-  assert.strictEqual(partialPair[0].role, "assistant");
-  assert.strictEqual(partialPair[0].tool_calls.length, 1);
-  assert.strictEqual(partialPair[0].tool_calls[0].id, "tc_a");
-  assert.strictEqual(partialPair[1].role, "tool");
-  assert.strictEqual(partialPair[1].tool_call_id, "tc_a");
-  assert.strictEqual(partialPair[2].role, "user");
+  assertToolCallAdjacency(partialPair, "partial parallel");
+  const toolIds = partialPair.filter((m) => m.role === "tool").map((m) => m.tool_call_id);
+  assert.deepStrictEqual(toolIds, ["call_1", "call_2"]);
+  assert.strictEqual(partialPair[1].content, "done");
+  assert.strictEqual(partialPair[2].content, SKIPPED_TOOL_STUB);
 
-  // Long Grok-style thread: several tool turns, no unpaired tool_calls at end.
+  // User comment mixed with tool-result in same turn → tools first, then user.
+  const mixedComment = toChatMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "call_1", toolName: "t", args: {} },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "tool-result", toolCallId: "call_1", result: "rejected" },
+        { type: "text", text: "no, do it differently" },
+      ],
+    },
+  ]);
+  assertToolCallAdjacency(mixedComment, "mixed comment");
+  assert.strictEqual(mixedComment[1].role, "tool");
+  assert.strictEqual(mixedComment[1].content, "rejected");
+  assert.strictEqual(mixedComment[2].role, "user");
+  assert.strictEqual(mixedComment[2].content, "no, do it differently");
+
+  // Long Grok-style thread: partial/missing results get stubs, adjacency throughout.
   const longThread = toChatMessages([
     { role: "user", content: "find the router" },
     {
@@ -727,42 +772,19 @@ assert.ok(hopBody.messages.some((m) => m.role === "user"));
       role: "tool",
       content: [{ type: "tool-result", toolCallId: "call_2", result: "contents" }],
     },
-    // call_3 result missing (harness dropped id) — must not leave dangling call_3.
     {
       role: "assistant",
       content: [{ type: "text", text: "Partial results." }],
     },
     { role: "user", content: "testing" },
   ]);
-  for (let ti = 0; ti < longThread.length; ti++) {
-    const msg = longThread[ti];
-    if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-      const ids = new Set(msg.tool_calls.map((tc) => tc.id));
-      let tj = ti + 1;
-      const seen = new Set();
-      while (tj < longThread.length && longThread[tj].role === "tool") {
-        seen.add(longThread[tj].tool_call_id);
-        tj++;
-      }
-      for (const id of ids) {
-        assert.ok(seen.has(id), "unpaired tool_call id " + id + " at index " + ti);
-      }
-      assert.strictEqual(
-        seen.size,
-        ids.size,
-        "tool message count must match tool_calls at index " + ti
-      );
-    }
-  }
+  assertToolCallAdjacency(longThread, "long thread");
   assert.ok(longThread.some((m) => m.role === "user" && m.content === "testing"));
-  assert.ok(
-    !longThread.some(
-      (m) =>
-        m.role === "assistant" &&
-        Array.isArray(m.tool_calls) &&
-        m.tool_calls.some((tc) => tc.id === "call_3")
-    )
+  const call3Tool = longThread.find(
+    (m) => m.role === "tool" && m.tool_call_id === "call_3"
   );
+  assert.ok(call3Tool, "call_3 must have stub tool message");
+  assert.strictEqual(call3Tool.content, SKIPPED_TOOL_STUB);
 }
 
 // makeHopStreamResult shape (not a Promise)

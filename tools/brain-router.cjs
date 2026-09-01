@@ -454,58 +454,111 @@ function stringifyArgs(args) {
   }
 }
 
+// UltraCode-Shim #3 / 7e5ca40: strict backends require one tool message per
+// tool_call_id immediately after assistant tool_calls. Stub missing ids.
+const SKIPPED_TOOL_STUB =
+  "Tool call was not executed (rejected or skipped by the user).";
+
 /**
- * DeepSeek/OpenAI require every assistant tool_calls id to have an immediate
- * following role:tool message. Drop unmatched tool_calls (prefer over empty synth).
+ * Repair assistant tool_calls adjacency for DeepSeek/OpenAI (UltraCode-Shim #3).
+ * Emit tool replies in call order immediately after each tool_calls message;
+ * synthesize SKIPPED_TOOL_STUB for unanswered ids; defer user text until after.
  */
 function sanitizeToolCallPairs(messages) {
   const list = Array.isArray(messages) ? messages : [];
   const out = [];
-  let i = 0;
-  while (i < list.length) {
+  let pendingIds = null;
+  let pendingAt = -1;
+
+  function collectTools(from, to, into) {
+    for (let k = from; k < to; k++) {
+      const t = list[k];
+      if (!t || t.role !== "tool") continue;
+      const id = String(t.tool_call_id || t.toolCallId || "");
+      if (id && !into.has(id)) into.set(id, t);
+    }
+  }
+
+  function flushPending(toolById) {
+    if (!pendingIds || !pendingIds.length) return;
+    const map = toolById || new Map();
+    for (const id of pendingIds) {
+      const hit = map.get(id);
+      if (hit) {
+        out.push({
+          role: "tool",
+          tool_call_id: String(hit.tool_call_id || hit.toolCallId || id),
+          content: hit.content == null ? "" : String(hit.content),
+        });
+      } else {
+        out.push({ role: "tool", tool_call_id: id, content: SKIPPED_TOOL_STUB });
+      }
+    }
+    pendingIds = null;
+    pendingAt = -1;
+  }
+
+  for (let i = 0; i < list.length; i++) {
     const m = list[i];
-    if (!m || typeof m !== "object") {
-      i++;
+    if (!m || typeof m !== "object") continue;
+    const role = m.role || "user";
+
+    if (
+      pendingIds &&
+      ((role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) ||
+        role === "assistant" ||
+        role === "system")
+    ) {
+      const toolById = new Map();
+      collectTools(pendingAt + 1, i, toolById);
+      flushPending(toolById);
+    }
+
+    if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      out.push({
+        role: "assistant",
+        content: m.content != null ? m.content : null,
+        tool_calls: m.tool_calls,
+      });
+      pendingIds = m.tool_calls.map((tc) => String(tc.id));
+      pendingAt = i;
       continue;
     }
-    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      const following = [];
+
+    if (role === "tool") {
+      if (!pendingIds) continue;
+      continue;
+    }
+
+    if (role === "user" && pendingIds) {
+      const toolById = new Map();
+      collectTools(pendingAt + 1, i, toolById);
       let j = i + 1;
       while (j < list.length && list[j] && list[j].role === "tool") {
-        following.push(list[j]);
+        const t = list[j];
+        const id = String(t.tool_call_id || t.toolCallId || "");
+        if (id && !toolById.has(id)) toolById.set(id, t);
         j++;
       }
-      const toolById = new Map();
-      for (const t of following) {
-        const id = t.tool_call_id || t.toolCallId;
-        if (id) toolById.set(String(id), t);
-      }
-      const keptCalls = m.tool_calls.filter((tc) => tc && toolById.has(String(tc.id)));
-      if (keptCalls.length) {
-        const keptIds = new Set(keptCalls.map((tc) => String(tc.id)));
-        const msg = {
-          role: "assistant",
-          content: m.content != null ? m.content : null,
-          tool_calls: keptCalls,
-        };
-        out.push(msg);
-        for (const t of following) {
-          const id = String(t.tool_call_id || t.toolCallId || "");
-          if (keptIds.has(id)) out.push(t);
-        }
-      } else if (typeof m.content === "string" && m.content.trim()) {
-        out.push({ role: "assistant", content: m.content });
-      }
-      i = j;
+      flushPending(toolById);
+      const userContent =
+        typeof m.content === "string"
+          ? m.content
+          : m.content != null
+            ? stringifyArgs(m.content)
+            : "";
+      out.push({ role: "user", content: userContent });
+      i = j - 1;
       continue;
     }
-    if (m.role === "tool") {
-      // Orphan tool (no preceding assistant tool_calls block) — skip.
-      i++;
-      continue;
-    }
+
     out.push(m);
-    i++;
+  }
+
+  if (pendingIds) {
+    const toolById = new Map();
+    collectTools(pendingAt + 1, list.length, toolById);
+    flushPending(toolById);
   }
   return out;
 }
@@ -632,10 +685,22 @@ function toChatMessages(list) {
           content: texts.length ? texts.join("") : null,
           tool_calls: toolCalls,
         });
-      } else if (texts.length) {
-        out.push({ role: role === "assistant" ? "assistant" : role, content: texts.join("") });
+        for (const tr of toolResults) out.push(tr);
+      } else {
+        // User tool-result parts must precede user text (UltraCode-Shim #3).
+        if (toolResults.length && role === "user") {
+          for (const tr of toolResults) out.push(tr);
+        }
+        if (texts.length) {
+          out.push({
+            role: role === "assistant" ? "assistant" : role,
+            content: texts.join(""),
+          });
+        }
+        if (toolResults.length && role !== "user") {
+          for (const tr of toolResults) out.push(tr);
+        }
       }
-      for (const tr of toolResults) out.push(tr);
       continue;
     }
 
@@ -1247,6 +1312,7 @@ module.exports = {
   hasChatPayload,
   makeHopStreamResult,
   failClosedStreamResult,
+  SKIPPED_TOOL_STUB,
   STOCK_PROVIDERS,
   LIVE_BRAINS,
   defaultBrainLogPath,
