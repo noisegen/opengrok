@@ -125,7 +125,8 @@ Key file: ~/sand-data/deepseek.env with DEEPSEEK_API_KEY=...
 
 New Bots stay Grok. Clones need on again.
 
-If intro fails: do not restart-host or recover. Quit Grok Bot and reopen.
+If intro fails: do not restart-host, recover, forceNow, or Update Computer.
+Desktop Quit Grok Bot drops the client only — it does NOT restart host-main.
 """
 
 # pack-brain.py fills these in brain-install-bundle.py
@@ -359,8 +360,11 @@ def main() -> None:
     restore_default_model(os.path.join(args.sand, "settings.json"), args.default_model)
 
     print()
-    print("Installed. One restart only (laptop awake):")
-    print("  cd ~/grok-bot-setup && ./adapters restart-host")
+    print("Installed on disk. Prefer: python3 ~/sand-data/ensure-brain-overlay.py")
+    print("Wire load: python3 ~/sand-data/install-supervisor-prestart.py")
+    print("Desktop Quit Grok Bot does NOT restart host-main.")
+    print("Wrap live only after a host process START with wrap already on disk.")
+    print("NEVER ./adapters restart-host / forceNow upgrade / Update Computer to apply.")
     print("Stay on ./adapters use cursor. Never use deepseek or recover.")
     print("Unassigned Bots stay Grok; assigned hop via ~/sand-data/deepseek.env")
     print("Toggle: python3 ~/sand-data/brain-assign.py on|off <UUID>")

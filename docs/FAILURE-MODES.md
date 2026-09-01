@@ -106,6 +106,49 @@ Legend: SYMPTOM (what you see) → CAUSE (what's actually wrong) → LOCK (the f
 - **CAUSE:** exclusive locks on credential databases.
 - **LOCK:** dedicated profiles/dir copies for automation; never fight the user's live session.
 
+### F19 — Durable hop bindings, stock host after recover (fleet desync)
+- **SYMPTOM:** after Grok Bot Computer recover / host update / boot-fetch,
+  sidebar and `brain-bindings.json` still say DeepSeek (or another hopped
+  brain), but the live host is stock again. Worse: patching `host-main` then
+  bouncing with supervisor `{kind:"upgrade", mode:"restart", forceNow:true}`
+  has twice taken down the **entire** Grok Bot fleet; John had to click
+  Update Computer to recover — and that boot-fetches stock sand-host,
+  wiping any sand-host-only overlay. Verified on a copy of live `9a145a6`:
+  after the stale-upgrade leftover-`}` fix, FULL-file `node --check` passes —
+  that brace bug (hid by slice-only checks) is the evidenced bounce killer;
+  do not claim other causes without further proof.
+- **CAUSE:** assignments + keys live in `sand-data`/`agent-data` (survive
+  recover; `agent-data` → `sand-data`). The wrap inside ephemeral
+  `sand-host/host-main.cjs` is wiped every boot-fetch. Stock
+  `/usr/local/bin/sand-supervisor.mjs` `launchHost()` hardcodes
+  `spawn(process.execPath, [HOST_ENTRY], …)` with **no** prestart —
+  `host-prestart-ensure.sh` alone is unused. Desktop Quit Grok Bot drops the
+  client only; it does **not** restart host-main. Recovered hosts may be
+  **Cursor-native-only** (wrap site:
+  `const session = createCursorInferencePromptSession(...); return session;`
+  beside `recordPostTurnLabeling`).
+- **LOCK:**
+  1. Durable `brain-router.cjs` under `sand-data`/`agent-data`. Host hook loads
+     via fail-closed `sand-brain durable-router` (missing/broken → native).
+  2. Disk wrap: `ensure-brain-overlay.py` (both host shapes, FULL-file
+     `node --check`, restore on failure). Unassigned never hop; hop/key errors
+     → native. Keys off git.
+  3. Load wire: `install-supervisor-prestart.py` patches `launchHost` to run
+     ensure **after** boot-fetch swap and **before** spawn (ensure failure
+     still spawns stock). Boot-fetch with that patch kept can re-apply the
+     wrap automatically. **Supervisor recycle** when `sand-host/version` ≠
+     `/etc/sand-box-image-sha` disarms boot-fetch (`shouldBootFetchHostBundle`
+     is false) — safe window to load prestart into memory without a bundle
+     fetch. **Host-only bounce** without supervisor recycle does not load
+     disk-only prestart.
+  4. **Update Computer recover cannot auto-restore the wrap** with the current
+     supervisor: the image resets `sand-supervisor.mjs`, and nothing durable
+     runs between restore and first spawn. After recover re-run ensure +
+     `install-supervisor-prestart.py` from sand-data; wrap goes live on the
+     next host process start through patched `launchHost` — not via desktop
+     quit. Optional: `detect-hop-durability.py` from sand-data. **Never**
+     Update Computer / `./adapters restart-host` / forceNow as the apply path.
+
 ---
 
 *Additions welcome — include reproduction steps and the lock that worked.*

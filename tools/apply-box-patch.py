@@ -189,24 +189,41 @@ def main():
         shutil.copy2(args.bindings, os.path.join(bk, "model-bindings.json.bak"))
     print(f"  backups -> {bk}")
 
-    if new_ht != ht:
-        write(args.host, new_ht)
-        print(f"  [host] {args.host} patched")
-    if new_hp != hp:
-        write(args.hop, new_hp)
-        print(f"  [hop]  {args.hop} patched")
+    def restore():
+        shutil.copy2(os.path.join(bk, "host-main.cjs.bak"), args.host)
+        shutil.copy2(os.path.join(bk, "openai-hop-session.cjs.bak"), args.hop)
+        print(f"  RESTORED host+hop from {bk}", file=sys.stderr)
 
-    # provider-maps.cjs must exist next to the hop
-    maps_dir = os.path.join(os.path.dirname(args.hop), "provider-maps.cjs")
-    if not os.path.exists(maps_dir) and os.path.exists(args.maps):
-        shutil.copy2(args.maps, maps_dir)
-        print(f"  [maps] {maps_dir} written")
-    elif not os.path.exists(maps_dir):
-        die("provider-maps.cjs missing on box — upload it (or pass --maps) before bouncing")
+    wrote = False
+    try:
+        if new_ht != ht:
+            write(args.host, new_ht)
+            print(f"  [host] {args.host} patched")
+            wrote = True
+        if new_hp != hp:
+            write(args.hop, new_hp)
+            print(f"  [hop]  {args.hop} patched")
+            wrote = True
 
-    print("== syntax check after patch ==")
-    node_check(args.host)
-    node_check(args.hop)
+        # provider-maps.cjs must exist next to the hop
+        maps_dir = os.path.join(os.path.dirname(args.hop), "provider-maps.cjs")
+        if not os.path.exists(maps_dir) and os.path.exists(args.maps):
+            shutil.copy2(args.maps, maps_dir)
+            print(f"  [maps] {maps_dir} written")
+        elif not os.path.exists(maps_dir):
+            die("provider-maps.cjs missing on box — upload it (or pass --maps) before bouncing")
+
+        print("== syntax check after patch ==")
+        node_check(args.host)
+        node_check(args.hop)
+    except SystemExit:
+        if wrote:
+            restore()
+        raise
+    except Exception as exc:
+        if wrote:
+            restore()
+        die(f"apply-box-patch failed after write; restored backup: {exc!r}")
 
     print("""
 DONE. Next steps (see docs/CLOUD-HOST.md):

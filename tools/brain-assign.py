@@ -19,7 +19,10 @@ import sys
 BINDINGS = os.environ.get(
     "BRAIN_BINDINGS", os.path.expanduser("~/sand-data/brain-bindings.json")
 )
-LOG = os.environ.get("BRAIN_LOG", "/tmp/sand-brain.log")
+LOG = os.environ.get(
+    "BRAIN_LOG",
+    os.path.expanduser("~/sand-data/hop-fail-logs/sand-brain.log"),
+)
 UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.I,

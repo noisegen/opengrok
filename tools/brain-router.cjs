@@ -13,7 +13,26 @@ const path = require("path");
 const BINDINGS =
   process.env.BRAIN_BINDINGS ||
   path.join(process.env.HOME || "/home/box", "sand-data", "brain-bindings.json");
-const LOG = process.env.BRAIN_LOG || "/tmp/sand-brain.log";
+
+/** Durable hop-fail log — /tmp dies on Update Computer; sand-data survives. */
+function defaultBrainLogPath() {
+  const home = process.env.HOME || "/home/box";
+  const sand = path.join(home, "sand-data", "hop-fail-logs", "sand-brain.log");
+  const agent = path.join(home, "agent-data", "hop-fail-logs", "sand-brain.log");
+  try {
+    if (fs.existsSync(path.join(home, "sand-data"))) return sand;
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (fs.existsSync(path.join(home, "agent-data"))) return agent;
+  } catch {
+    /* ignore */
+  }
+  return "/tmp/sand-brain.log";
+}
+
+const LOG = process.env.BRAIN_LOG || defaultBrainLogPath();
 const UUID_RE =
   /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const ID_KEY_RE =
@@ -60,9 +79,14 @@ const STOCK_PROVIDERS = {
 
 function logLine(msg) {
   try {
+    try {
+      fs.mkdirSync(path.dirname(LOG), { recursive: true });
+    } catch {
+      /* ignore */
+    }
     fs.appendFileSync(LOG, new Date().toISOString() + " " + msg + "\n");
   } catch {
-    /* ignore */
+    /* logging must never throw into hop */
   }
 }
 
@@ -87,11 +111,28 @@ function collect(obj, out, depth) {
     return;
   }
   if (typeof obj !== "object") return;
-  for (const [k, v] of Object.entries(obj)) {
-    if (ID_KEY_RE.test(k) && typeof v === "string" && v.trim()) {
-      out.add(v.trim().toLowerCase());
+  let entries;
+  try {
+    entries = Object.entries(obj);
+  } catch {
+    return;
+  }
+  for (const [k, v] of entries) {
+    try {
+      if (ID_KEY_RE.test(k) && typeof v === "string" && v.trim()) {
+        out.add(v.trim().toLowerCase());
+      } else if (ID_KEY_RE.test(k) && typeof v === "function" && v.length === 0) {
+        try {
+          const got = v.call(obj);
+          if (typeof got === "string" && got.trim()) out.add(got.trim().toLowerCase());
+        } catch {
+          /* ignore */
+        }
+      }
+      if (typeof v !== "function") collect(v, out, depth + 1);
+    } catch {
+      /* ignore hostile getters */
     }
-    collect(v, out, depth + 1);
   }
 }
 
@@ -100,6 +141,50 @@ function candidateIds(sessionOptions, requestedModel) {
   collect(sessionOptions, out, 0);
   collect(requestedModel, out, 0);
   return [...out];
+}
+
+/** Merge wrap-time identity from sessionOptions + options2 + hints for resolveBrain. */
+function buildIdentityBag(opts) {
+  const bag = Object.assign({}, (opts && opts.sessionOptions) || {});
+  const extras = [opts && opts.options2, opts && opts.identityBag, opts && opts.context];
+  for (const src of extras) {
+    if (!src || typeof src !== "object") continue;
+    for (const key of [
+      "agentId",
+      "agent_id",
+      "conversationId",
+      "conversation_id",
+      "bcId",
+      "bc_id",
+      "botId",
+      "bot_id",
+      "provenanceAgentId",
+    ]) {
+      if (bag[key]) continue;
+      try {
+        const v = src[key];
+        if (typeof v === "string" && v.trim()) bag[key] = v.trim();
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const g of ["getAgentId", "getBotId", "getConversationId", "getBcId", "getAgentBCId"]) {
+      try {
+        if (typeof src[g] !== "function" || src[g].length !== 0) continue;
+        const got = src[g]();
+        if (typeof got !== "string" || !got.trim()) continue;
+        const s = got.trim();
+        if (!bag.agentId && /agent/i.test(g)) bag.agentId = s;
+        else if (!bag.conversationId && /conversation/i.test(g)) bag.conversationId = s;
+        else if (!bag.bcId && /bc/i.test(g)) bag.bcId = s;
+        else if (!bag.botId && /bot/i.test(g)) bag.botId = s;
+        else if (!bag.agentId) bag.agentId = s;
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return bag;
 }
 
 function agentEntry(agents, id) {
@@ -120,13 +205,19 @@ function providerOf(data, brainId) {
   return Object.assign({ id }, stock, fromFile);
 }
 
-function resolveBrain(sessionOptions, requestedModel) {
+function resolveBrain(sessionOptions, requestedModel, moreSources) {
   const opts = sessionOptions || {};
   if (opts.isSummarizationSession === true) {
     logLine("summarization -> grok");
     return providerOf({}, "grok");
   }
-  const ids = candidateIds(opts, requestedModel);
+  const idSet = new Set(candidateIds(opts, requestedModel));
+  if (Array.isArray(moreSources)) {
+    for (const src of moreSources) collect(src, idSet, 0);
+  } else if (moreSources) {
+    collect(moreSources, idSet, 0);
+  }
+  const ids = [...idSet];
   const keys =
     opts && typeof opts === "object" && !Array.isArray(opts)
       ? Object.keys(opts)
@@ -345,16 +436,551 @@ function loadHopKey(brain) {
   return "";
 }
 
+function partText(part) {
+  if (part == null) return "";
+  if (typeof part === "string") return part;
+  if (typeof part !== "object") return String(part);
+  if (typeof part.text === "string") return part.text;
+  if (typeof part.content === "string") return part.content;
+  return "";
+}
+
+function stringifyArgs(args) {
+  if (typeof args === "string") return args;
+  try {
+    return JSON.stringify(args == null ? {} : args);
+  } catch {
+    return "{}";
+  }
+}
+
+// UltraCode-Shim #3 / 7e5ca40: strict backends require one tool message per
+// tool_call_id immediately after assistant tool_calls. Stub missing ids.
+const SKIPPED_TOOL_STUB =
+  "Tool call was not executed (rejected or skipped by the user).";
+
+/**
+ * Repair assistant tool_calls adjacency for DeepSeek/OpenAI (UltraCode-Shim #3).
+ * Emit tool replies in call order immediately after each tool_calls message;
+ * synthesize SKIPPED_TOOL_STUB for unanswered ids; defer user text until after.
+ */
+function sanitizeToolCallPairs(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+  let pendingIds = null;
+  let pendingAt = -1;
+
+  function collectTools(from, to, into) {
+    for (let k = from; k < to; k++) {
+      const t = list[k];
+      if (!t || t.role !== "tool") continue;
+      const id = String(t.tool_call_id || t.toolCallId || "");
+      if (id && !into.has(id)) into.set(id, t);
+    }
+  }
+
+  function flushPending(toolById) {
+    if (!pendingIds || !pendingIds.length) return;
+    const map = toolById || new Map();
+    for (const id of pendingIds) {
+      const hit = map.get(id);
+      if (hit) {
+        out.push({
+          role: "tool",
+          tool_call_id: String(hit.tool_call_id || hit.toolCallId || id),
+          content: hit.content == null ? "" : String(hit.content),
+        });
+      } else {
+        out.push({ role: "tool", tool_call_id: id, content: SKIPPED_TOOL_STUB });
+      }
+    }
+    pendingIds = null;
+    pendingAt = -1;
+  }
+
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    if (!m || typeof m !== "object") continue;
+    const role = m.role || "user";
+
+    if (
+      pendingIds &&
+      ((role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) ||
+        role === "assistant" ||
+        role === "system")
+    ) {
+      const toolById = new Map();
+      collectTools(pendingAt + 1, i, toolById);
+      flushPending(toolById);
+    }
+
+    if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      out.push({
+        role: "assistant",
+        content: m.content != null ? m.content : null,
+        tool_calls: m.tool_calls,
+      });
+      pendingIds = m.tool_calls.map((tc) => String(tc.id));
+      pendingAt = i;
+      continue;
+    }
+
+    if (role === "tool") {
+      if (!pendingIds) continue;
+      continue;
+    }
+
+    if (role === "user" && pendingIds) {
+      const toolById = new Map();
+      collectTools(pendingAt + 1, i, toolById);
+      let j = i + 1;
+      while (j < list.length && list[j] && list[j].role === "tool") {
+        const t = list[j];
+        const id = String(t.tool_call_id || t.toolCallId || "");
+        if (id && !toolById.has(id)) toolById.set(id, t);
+        j++;
+      }
+      flushPending(toolById);
+      const userContent =
+        typeof m.content === "string"
+          ? m.content
+          : m.content != null
+            ? stringifyArgs(m.content)
+            : "";
+      out.push({ role: "user", content: userContent });
+      i = j - 1;
+      continue;
+    }
+
+    out.push(m);
+  }
+
+  if (pendingIds) {
+    const toolById = new Map();
+    collectTools(pendingAt + 1, list.length, toolById);
+    flushPending(toolById);
+  }
+  return out;
+}
+
+/**
+ * Convert AI-SDK / Grok core messages to OpenAI chat.completions messages.
+ * Preserves assistant tool_calls before role:tool (DeepSeek 400 otherwise).
+ * Never JSON.stringifies whole part arrays into content.
+ */
 function toChatMessages(list) {
-  return (Array.isArray(list) ? list : []).map((m) => ({
-    role: (m && m.role) || "user",
-    content:
-      m && typeof m.content === "string"
-        ? m.content
-        : m && m.content != null
-          ? JSON.stringify(m.content)
-          : "",
+  const out = [];
+  for (const m of Array.isArray(list) ? list : []) {
+    if (!m || typeof m !== "object") continue;
+    const role = m.role || "user";
+    const content = m.content;
+    const parts = Array.isArray(content)
+      ? content
+      : Array.isArray(m.parts)
+        ? m.parts
+        : null;
+
+    if (role === "tool" || role === "function") {
+      let id = m.tool_call_id || m.toolCallId || "";
+      let c = content;
+      if (parts) {
+        for (const part of parts) {
+          if (!part || typeof part !== "object") continue;
+          const t = part.type;
+          if (t === "tool-result" || t === "tool_result") {
+            if (!id) id = part.toolCallId || part.tool_call_id || part.id || "";
+            let result =
+              part.result != null
+                ? part.result
+                : part.output != null
+                  ? part.output
+                  : part.content;
+            if (typeof result !== "string") result = stringifyArgs(result);
+            c = result;
+          } else {
+            const s = partText(part);
+            if (s) c = typeof c === "string" && c ? c + s : s;
+          }
+        }
+      } else if (Array.isArray(c)) {
+        c = c.map(partText).filter(Boolean).join("") || stringifyArgs(c);
+      } else if (typeof c !== "string") {
+        c = c != null ? stringifyArgs(c) : "";
+      }
+      if (!id) continue;
+      out.push({ role: "tool", tool_call_id: String(id), content: c == null ? "" : String(c) });
+      continue;
+    }
+
+    if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const msg = { role: "assistant", tool_calls: m.tool_calls, content: null };
+      if (typeof content === "string" && content) msg.content = content;
+      else if (parts) {
+        const texts = parts.map(partText).filter(Boolean);
+        if (texts.length) msg.content = texts.join("");
+      }
+      out.push(msg);
+      continue;
+    }
+
+    if (parts) {
+      const texts = [];
+      const toolCalls = [];
+      const toolResults = [];
+      for (const part of parts) {
+        if (part == null) continue;
+        if (typeof part !== "object") {
+          const t = partText(part);
+          if (t) texts.push(t);
+          continue;
+        }
+        const t = part.type;
+        if (t === "text" || t === "input_text" || t === "output_text") {
+          const s = partText(part);
+          if (s) texts.push(s);
+        } else if (t === "tool-call" || t === "tool_call") {
+          const id = part.toolCallId || part.tool_call_id || part.id;
+          const name =
+            part.toolName ||
+            part.tool_name ||
+            (part.function && part.function.name) ||
+            "";
+          const args =
+            part.args != null
+              ? part.args
+              : part.arguments != null
+                ? part.arguments
+                : part.function && part.function.arguments;
+          if (id && name) {
+            toolCalls.push({
+              id: String(id),
+              type: "function",
+              function: { name: String(name), arguments: stringifyArgs(args) },
+            });
+          }
+        } else if (t === "tool-result" || t === "tool_result") {
+          const id = part.toolCallId || part.tool_call_id || part.id;
+          let result =
+            part.result != null
+              ? part.result
+              : part.output != null
+                ? part.output
+                : part.content;
+          if (typeof result !== "string") result = stringifyArgs(result);
+          if (id) {
+            toolResults.push({
+              role: "tool",
+              tool_call_id: String(id),
+              content: result,
+            });
+          }
+        } else {
+          const s = partText(part);
+          if (s) texts.push(s);
+        }
+      }
+      if (toolCalls.length) {
+        out.push({
+          role: "assistant",
+          content: texts.length ? texts.join("") : null,
+          tool_calls: toolCalls,
+        });
+        for (const tr of toolResults) out.push(tr);
+      } else {
+        // User tool-result parts must precede user text (UltraCode-Shim #3).
+        if (toolResults.length && role === "user") {
+          for (const tr of toolResults) out.push(tr);
+        }
+        if (texts.length) {
+          out.push({
+            role: role === "assistant" ? "assistant" : role,
+            content: texts.join(""),
+          });
+        }
+        if (toolResults.length && role !== "user") {
+          for (const tr of toolResults) out.push(tr);
+        }
+      }
+      continue;
+    }
+
+    if (typeof content === "string") {
+      if (!content && role !== "assistant") continue;
+      out.push({ role, content });
+      continue;
+    }
+
+    // Skip unknown non-string content (do not dump objects into content).
+  }
+  return sanitizeToolCallPairs(out);
+}
+
+function hasChatPayload(messages) {
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m) continue;
+    const role = m.role || "";
+    // System-only identity is not enough to POST; need user/assistant/tool payload.
+    if (role === "system") continue;
+    if (role === "tool" && m.tool_call_id) return true;
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length) return true;
+    if (typeof m.content === "string" && m.content.trim()) return true;
+  }
+  return false;
+}
+
+function redactHopSnippet(s) {
+  return String(s || "")
+    .replace(/sk-[A-Za-z0-9._-]{8,}/g, "[redacted]")
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .slice(0, 300);
+}
+
+async function readHopHttpError(res) {
+  const status = (res && res.status) || 0;
+  let raw = "";
+  try {
+    if (res && typeof res.text === "function") raw = await res.text();
+  } catch {
+    raw = "";
+  }
+  let message = "";
+  try {
+    const j = JSON.parse(raw);
+    const err = j && j.error;
+    message =
+      (err && (err.message || err.code || err.type)) ||
+      (typeof j.message === "string" ? j.message : "") ||
+      "";
+  } catch {
+    message = raw;
+  }
+  return { status, message: redactHopSnippet(message) };
+}
+
+/**
+ * Native host-main (~506623 summarization, ~533368 self-summary, ~580052 tool
+ * stream wrapper) calls .catch on response, usage, extendedUsage,
+ * providerMetadata, and invocationId. Missing fields → undefined.catch crash.
+ */
+function completeStreamResult(partial) {
+  if (!partial || typeof partial !== "object" || typeof partial.then === "function") {
+    return partial;
+  }
+  if (!partial.fullStream && partial.response == null) return partial;
+
+  function asPromise(v, fallback) {
+    if (v != null && typeof v.then === "function") return v;
+    return Promise.resolve(v !== undefined ? v : fallback());
+  }
+
+  const response = asPromise(partial.response, () => ({ modelId: "unknown" }));
+  const usage = asPromise(partial.usage, () => ({
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
   }));
+  const extendedUsage = asPromise(partial.extendedUsage, () => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  }));
+  const providerMetadata = asPromise(partial.providerMetadata, () => undefined);
+  const invocationId = asPromise(partial.invocationId, () => undefined);
+
+  response.catch(() => {});
+  usage.catch(() => {});
+  extendedUsage.catch(() => {});
+  providerMetadata.catch(() => {});
+  invocationId.catch(() => {});
+
+  return {
+    fullStream: partial.fullStream,
+    response,
+    usage,
+    extendedUsage,
+    providerMetadata,
+    invocationId,
+  };
+}
+
+async function resolveStreamField(result, key, fallback) {
+  if (!result || typeof result !== "object") return fallback();
+  const v = result[key];
+  if (v == null) return fallback();
+  return typeof v.then === "function" ? await v : v;
+}
+
+/**
+ * Native executor.stream() returns a stream-result OBJECT synchronously
+ * (fullStream / response / usage / extendedUsage / providerMetadata /
+ * invocationId). Returning a Promise makes UsageSanitizingMiddleware read
+ * undefined.modelId and kill inference.
+ */
+function makeHopStreamResult(innerPromise, model) {
+  const modelId = String(model || "deepseek-v4-flash");
+  const inner = Promise.resolve(innerPromise);
+  const response = inner.then(() => ({ modelId }));
+  const usage = inner.then(() => ({
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+  }));
+  const extendedUsage = inner.then(() => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  }));
+  const providerMetadata = inner.then(() => undefined);
+  const invocationId = inner.then(() => undefined);
+  // Derived promises reject when hop fails; swallow until failClosed / caller attaches.
+  inner.catch(() => {});
+  response.catch(() => {});
+  usage.catch(() => {});
+  extendedUsage.catch(() => {});
+  providerMetadata.catch(() => {});
+  invocationId.catch(() => {});
+
+  return completeStreamResult({
+    fullStream: (async function* () {
+      const data = await inner;
+      const text = (data && data.text) || "";
+      if (text) {
+        yield { type: "text-delta", textDelta: text };
+      }
+    })(),
+    response,
+    usage,
+    extendedUsage,
+    providerMetadata,
+    invocationId,
+  });
+}
+
+function rejectHopStreamResult(err, model) {
+  const rejected = Promise.reject(err);
+  rejected.catch(() => {});
+  return completeStreamResult({
+    fullStream: (async function* () {
+      await rejected;
+    })(),
+    response: rejected,
+    usage: rejected,
+    extendedUsage: rejected,
+    providerMetadata: rejected,
+    invocationId: rejected,
+  });
+}
+
+/**
+ * If hop stream-result fails (HTTP/empty), fall back to native origStream.
+ * Always returns a sync value (never a raw Promise from hop).
+ * Opaque sync returns from custom createHopSession (tests/legacy) pass through.
+ */
+function failClosedStreamResult(hopResult, origStream, args) {
+  if (!origStream) return hopResult;
+
+  // Bug 2: hop.stream() must not return a Promise to the harness.
+  if (hopResult != null && typeof hopResult.then === "function") {
+    try {
+      hopResult.catch(() => {});
+    } catch {
+      /* ignore */
+    }
+    logLine("hop stream not a stream-result -> native");
+    return completeStreamResult(origStream.apply(null, args));
+  }
+
+  // Proper stream-result: wrap so async HTTP/empty rejection uses native.
+  if (
+    hopResult &&
+    typeof hopResult === "object" &&
+    hopResult.response &&
+    hopResult.fullStream
+  ) {
+    let nativeResult = null;
+    const getNative = () => {
+      if (!nativeResult) nativeResult = origStream.apply(null, args);
+      return nativeResult;
+    };
+
+    // Swallow hop-side rejections until decided chooses.
+    Promise.resolve(hopResult.response).catch(() => {});
+    Promise.resolve(hopResult.usage).catch(() => {});
+    Promise.resolve(hopResult.extendedUsage).catch(() => {});
+    Promise.resolve(hopResult.providerMetadata).catch(() => {});
+    Promise.resolve(hopResult.invocationId).catch(() => {});
+
+    const decided = Promise.resolve(hopResult.response).then(
+      () => ({ kind: "hop", result: hopResult }),
+      (err) => {
+        logLine("hop stream failed -> native: " + ((err && err.message) || err));
+        return { kind: "native", result: getNative() };
+      }
+    );
+
+    return completeStreamResult({
+      fullStream: (async function* () {
+        const d = await decided;
+        const r = d.result;
+        if (!r || typeof r !== "object" || !r.fullStream) return;
+        for await (const ev of r.fullStream) yield ev;
+      })(),
+      response: decided.then((d) =>
+        resolveStreamField(d.result, "response", () => ({ modelId: "native" }))
+      ),
+      usage: decided.then((d) =>
+        resolveStreamField(d.result, "usage", () => ({
+          totalTokens: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+        }))
+      ),
+      extendedUsage: decided.then((d) =>
+        resolveStreamField(d.result, "extendedUsage", () => ({
+          inputTokens: 0,
+          outputTokens: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+        }))
+      ),
+      providerMetadata: decided.then((d) =>
+        resolveStreamField(d.result, "providerMetadata", () => undefined)
+      ),
+      invocationId: decided.then((d) =>
+        resolveStreamField(d.result, "invocationId", () => undefined)
+      ),
+    });
+  }
+
+  // Opaque sync hop return (string / custom) — pass through unchanged.
+  return hopResult;
+}
+
+/**
+ * Hop executor surface expected by host-main (SimplePromptToolExecutor /
+ * RedactedPromptToolExecutor): getState, getMessages, clearMessages, appendMessages, stream.
+ */
+function buildHopExecutor(messages, streamFn) {
+  return {
+    getState() {
+      return Array.isArray(messages) ? messages.slice() : [];
+    },
+    getMessages() {
+      return messages;
+    },
+    clearMessages() {
+      messages = [];
+    },
+    appendMessages(next) {
+      if (Array.isArray(next)) messages = messages.concat(next);
+    },
+    stream: streamFn,
+  };
 }
 
 function createDeepseekHopSession(brain, opts) {
@@ -363,7 +989,10 @@ function createDeepseekHopSession(brain, opts) {
     logLine("hop no-key -> native");
     return null;
   }
-  const base = String((brain && brain.baseUrl) || "https://api.deepseek.com/v1").replace(/\/+$/, "");
+  const base = String((brain && brain.baseUrl) || "https://api.deepseek.com/v1").replace(
+    /\/+$/,
+    ""
+  );
   const model = (brain && brain.model) || "deepseek-v4-flash";
   const fetchFn = (opts && opts.hopFetch) || globalThis.fetch;
   if (typeof fetchFn !== "function") {
@@ -385,51 +1014,62 @@ function createDeepseekHopSession(brain, opts) {
             ? initialMessages.slice()
             : [];
       messages = seeded;
-      return {
-        getMessages() {
-          return messages;
-        },
-        clearMessages() {
-          messages = [];
-        },
-        appendMessages(next) {
-          if (Array.isArray(next)) messages = messages.concat(next);
-        },
-        stream: function () {
-          return Promise.resolve(
-            fetchFn(base + "/chat/completions", {
-              method: "POST",
-              headers: {
-                Authorization: "Bearer " + key,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                model,
-                messages: toChatMessages(messages),
-                stream: false,
-              }),
-            })
-          ).then((res) => {
+      return buildHopExecutor(messages, function () {
+          const chatMessages = toChatMessages(messages);
+          if (!hasChatPayload(chatMessages)) {
+            logLine("hop empty messages -> fail-closed");
+            return rejectHopStreamResult(new Error("hop empty messages"), model);
+          }
+          const inner = (async () => {
+            const res = await Promise.resolve(
+              fetchFn(base + "/chat/completions", {
+                method: "POST",
+                headers: {
+                  Authorization: "Bearer " + key,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  model,
+                  messages: chatMessages,
+                  stream: false,
+                }),
+              })
+            );
             if (!res || !res.ok) {
-              throw new Error("hop http " + (res && res.status));
+              const info = await readHopHttpError(res);
+              logLine(
+                "hop http " + info.status + (info.message ? ": " + info.message : "")
+              );
+              throw new Error(
+                "hop http " + info.status + (info.message ? ": " + info.message : "")
+              );
             }
-            return typeof res.json === "function" ? res.json() : res;
-          }).then((json) => {
+            const json = typeof res.json === "function" ? await res.json() : res;
             const choice = json && json.choices && json.choices[0];
             const msg = choice && choice.message;
-            return (msg && msg.content) || "";
-          });
-        },
-      };
+            return { text: (msg && msg.content) || "", modelId: model };
+          })();
+          return makeHopStreamResult(inner, model);
+      });
     },
   };
 }
 
 function brandedHop(opts, so, brain) {
-  if (typeof opts.createHopSession === "function") {
-    return opts.createHopSession(brain, opts, so);
+  try {
+    if (typeof opts.createHopSession === "function") {
+      return opts.createHopSession(brain, opts, so);
+    }
+    return createDeepseekHopSession(brain, opts);
+  } catch (err) {
+    logLine("hop create failed -> native: " + ((err && err.message) || err));
+    try {
+      console.error("[sand-brain] hop create failed, native:", err);
+    } catch {
+      /* ignore */
+    }
+    return null;
   }
-  return createDeepseekHopSession(brain, opts);
 }
 
 function brainLog(convId, brainId, where) {
@@ -457,7 +1097,49 @@ function materializeSession(opts, convId) {
   const brain = resolveBrain(so, opts.requestedModel);
   if (brain && brain.kind !== "native") {
     const hop = brandedHop(opts, so, brain);
-    if (hop) return hop;
+    if (hop) {
+      // Lazy native: only materialize if hop stream fails closed.
+      let nativeSess = null;
+      const getNative = () => {
+        if (!nativeSess) {
+          nativeSess = openNative(
+            Object.assign({}, opts, { sessionOptions: so }),
+            opts.onRequestId
+          );
+        }
+        return nativeSess;
+      };
+      const hopGetExecutor =
+        typeof hop.getExecutor === "function" ? hop.getExecutor.bind(hop) : null;
+      return proxyObject(hop, {
+        getExecutor: function (initialMessages) {
+          const hex = hopGetExecutor
+            ? hopGetExecutor.apply(hop, arguments)
+            : null;
+          if (!hex || typeof hex.stream !== "function") {
+            const n = getNative();
+            return n.getExecutor.apply(n, arguments);
+          }
+          const execArgs = arguments;
+          const origStream = function () {
+            const n = getNative();
+            const nex = n.getExecutor.apply(n, execArgs);
+            return nex.stream.apply(nex, arguments);
+          };
+          return proxyObject(hex, {
+            stream: function () {
+              try {
+                const hopResult = hex.stream.apply(hex, arguments);
+                return failClosedStreamResult(hopResult, origStream, arguments);
+              } catch (err) {
+                logLine("alt stream failed, native: " + (err && err.message));
+                return origStream.apply(null, arguments);
+              }
+            },
+          });
+        },
+      });
+    }
     logLine("hop unavailable -> native");
   }
   if (typeof opts.nativeFactory === "function") {
@@ -498,17 +1180,22 @@ function wrapExecutor(ex, onStream, initialMessages, altExecutor) {
   return proxyObject(ex, {
     stream: function (ctx) {
       if (typeof onStream === "function") onStream(ctx);
+      const args = arguments;
       try {
         const seed = snapshotMessages(ex, initialMessages);
         const alt = typeof altExecutor === "function" ? altExecutor(seed) : null;
         if (alt && typeof alt.stream === "function") {
-          return alt.stream.apply(alt, arguments);
+          const hopResult = alt.stream.apply(alt, args);
+          if (origStream) {
+            return failClosedStreamResult(hopResult, origStream, args);
+          }
+          return hopResult;
         }
       } catch (err) {
         logLine("alt stream failed, native: " + (err && err.message));
       }
       if (!origStream) throw new Error("sand-brain: no stream");
-      return origStream.apply(null, arguments);
+      return origStream.apply(null, args);
     },
   });
 }
@@ -538,20 +1225,124 @@ function readOptsId(opts) {
   );
 }
 
-function buildLazyBrainSession(opts) {
-  const origOnRequestId = opts.onRequestId;
-  const wrapId = readOptsId(opts);
-  if (wrapId) {
-    const so = Object.assign({}, opts.sessionOptions || {}, { conversationId: wrapId });
-    const brain = resolveBrain(so, opts.requestedModel);
-    brainLog(wrapId, (brain && brain.id) || "grok", "store");
-    if (brain && brain.kind !== "native") {
-      return materializeSession(opts, wrapId);
+function resolveFromOpts(opts, so, more) {
+  const bag = so || buildIdentityBag(opts);
+  const extras = [opts && opts.options2, opts && opts.identityBag, more].filter(Boolean);
+  return resolveBrain(bag, opts.requestedModel, extras);
+}
+
+/**
+ * When wrap-time identity is empty, do NOT eagerly native forever.
+ * Re-resolve at getExecutor / stream (where=stream) once ctx/sessionOptions carry an id.
+ */
+function createDeferredHopSession(opts) {
+  const native = openNative(opts, opts.onRequestId);
+  let hopped = null;
+
+  function tryHop(where, argsLike, ctx) {
+    if (hopped) return hopped;
+    const bag = buildIdentityBag(opts);
+    const fromArgs = idFromCallArgs(opts, argsLike);
+    const fromCtx = ctx != null ? fromStore(ctx, opts.conversationIdKey, opts.getConversationId) : "";
+    const wrapId = readOptsId(opts);
+    const id = fromArgs || fromCtx || wrapId || bag.conversationId || bag.agentId || bag.bcId || bag.botId || "";
+    if (id) {
+      if (!bag.conversationId) bag.conversationId = id;
+      if (
+        !bag.agentId &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+      ) {
+        bag.agentId = id;
+      }
     }
-  } else {
-    brainLog("", "grok", "none");
+    const brain = resolveFromOpts(
+      Object.assign({}, opts, { sessionOptions: bag }),
+      bag,
+      ctx
+    );
+    const label = id || (brain && brain.agentId) || "";
+    brainLog(label, (brain && brain.id) || "grok", where);
+    if (brain && brain.kind !== "native") {
+      hopped = materializeSession(
+        Object.assign({}, opts, { sessionOptions: bag }),
+        label || brain.agentId
+      );
+      return hopped;
+    }
+    return null;
   }
-  return openNative(opts, origOnRequestId);
+
+  return proxyObject(native, {
+    getExecutor: function (initialMessages) {
+      try {
+        const hop = tryHop("executor", [], null);
+        if (hop && typeof hop.getExecutor === "function") {
+          return hop.getExecutor(initialMessages);
+        }
+      } catch (err) {
+        logLine("executor hop failed, native: " + ((err && err.message) || err));
+      }
+      const ex = native.getExecutor.apply(native, arguments);
+      if (!ex || typeof ex !== "object") return ex;
+      const origStream = typeof ex.stream === "function" ? ex.stream.bind(ex) : null;
+      return proxyObject(ex, {
+        stream: function (ctx) {
+          const args = arguments;
+          try {
+            const hop = tryHop("stream", args, ctx);
+            if (hop && typeof hop.getExecutor === "function") {
+              const seed = snapshotMessages(ex, initialMessages);
+              const hex = hop.getExecutor(seed);
+              if (hex && typeof hex.stream === "function") {
+                const hopResult = hex.stream.apply(hex, args);
+                if (origStream) {
+                  return failClosedStreamResult(hopResult, origStream, args);
+                }
+                return hopResult;
+              }
+            }
+          } catch (err) {
+            logLine("stream hop failed, native: " + ((err && err.message) || err));
+          }
+          if (!origStream) throw new Error("sand-brain: no stream");
+          return origStream.apply(null, args);
+        },
+      });
+    },
+  });
+}
+
+function buildLazyBrainSession(opts) {
+  opts = opts || {};
+  const origOnRequestId = opts.onRequestId;
+  const bag = buildIdentityBag(opts);
+  opts = Object.assign({}, opts, { sessionOptions: bag });
+
+  const wrapId = readOptsId(opts);
+  const brain = resolveFromOpts(opts, bag);
+  const earlyId =
+    wrapId ||
+    bag.conversationId ||
+    bag.agentId ||
+    bag.bcId ||
+    bag.botId ||
+    (brain && brain.agentId) ||
+    "";
+
+  if (earlyId) {
+    const so = Object.assign({}, bag, wrapId ? { conversationId: wrapId } : {});
+    // Re-resolve with conversationId filled when wrapId came from ALS/store.
+    const brain2 = resolveFromOpts(Object.assign({}, opts, { sessionOptions: so }), so);
+    brainLog(earlyId, (brain2 && brain2.id) || "grok", "store");
+    if (brain2 && brain2.kind !== "native") {
+      return materializeSession(Object.assign({}, opts, { sessionOptions: so }), earlyId);
+    }
+    return openNative(Object.assign({}, opts, { sessionOptions: so }), origOnRequestId);
+  }
+
+  // No bot identity at wrap — log and defer. Empty cid must not nail native forever.
+  brainLog("", "grok", "none");
+  return createDeferredHopSession(opts);
 }
 
 function createLazyBrainSession(opts) {
@@ -591,6 +1382,7 @@ module.exports = {
   shouldUseDeepseek,
   resolveBrain,
   candidateIds,
+  buildIdentityBag,
   identityText,
   injectIdentity,
   readConversationId,
@@ -599,6 +1391,17 @@ module.exports = {
   createBrandedSession,
   createDeepseekHopSession,
   loadHopKey,
+  toChatMessages,
+  sanitizeToolCallPairs,
+  hasChatPayload,
+  makeHopStreamResult,
+  failClosedStreamResult,
+  completeStreamResult,
+  buildHopExecutor,
+  SKIPPED_TOOL_STUB,
   STOCK_PROVIDERS,
   LIVE_BRAINS,
+  defaultBrainLogPath,
+  logLine,
+  LOG,
 };

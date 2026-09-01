@@ -77,8 +77,37 @@ if node:
         fails.append(f"map tests: {tail}")
     else:
         print(f"map tests: {tail}")
+    r = subprocess.run([node, str(HERE / "tools" / "test-provider-maps-hop.cjs")], capture_output=True, text=True)
+    tail = ((r.stdout or "").strip().splitlines() or ["?"])[-1]
+    if r.returncode:
+        fails.append(f"hop map tests: {tail}")
+    else:
+        print(f"hop map tests: {tail}")
+    r = subprocess.run([node, str(HERE / "tools" / "test-brain-router.cjs")], capture_output=True, text=True)
+    tail = ((r.stdout or "").strip().splitlines() or ["?"])[-1]
+    if r.returncode:
+        fails.append(f"brain-router tests: {tail or r.stderr[-120:]}")
+    else:
+        print(f"brain-router tests: {tail}")
 else:
     warns.append("node not found - map tests skipped")
+
+# 5. brain overlay / box-patch suites (stock → apply, noop, drift)
+for name in (
+    "test-brain-install.py",
+    "test-brain-assign.py",
+    "test-ensure-brain-overlay.py",
+    "test-install-supervisor-prestart.py",
+    "test-supervisor-boot-fetch.py",
+):
+    r = subprocess.run([sys.executable, str(HERE / "tools" / name)], capture_output=True, text=True)
+    if r.returncode:
+        tail = ((r.stderr or r.stdout or "").strip().splitlines() or ["?"])[-1]
+        fails.append(f"{name}: {tail}")
+    else:
+        # unittest prints summary on stderr
+        summary = ((r.stderr or r.stdout or "").strip().splitlines() or ["ok"])[-1]
+        print(f"{name}: {summary}")
 
 print()
 for w in warns:

@@ -3,37 +3,102 @@ Per-Bot DeepSeek — stay on cursor
 Default is Grok 4.6. Assigned UUIDs hop to api.deepseek.com using
 ~/sand-data/deepseek.env (DEEPSEEK_API_KEY=...). Unassigned Bots get a
 raw Cursor session (no Proxy). Live id is lazy conv= at create
-(where=store) or where=none.
+(where=store) or where=none — or where=stream when id arrives late.
 
 Do NOT:
   ./adapters use deepseek
   ./adapters recover
   ./adapters restart-host
+  Update Grok Bot's Computer          (that is RECOVER, not apply)
+  supervisor forceNow upgrade bounce  (twice took down the fleet)
   python3 brain-install-bundle.py
+  hand-edit the ~25MB host-main.cjs
+  claim "Quit Grok Bot and reopen" loads patched host-main
+    (desktop quit drops the client only; host-main is always-on under
+     /usr/local/bin/sand-supervisor.mjs)
 
-Intro dead / out of sync: fully Quit Grok Bot and reopen. Stay on cursor.
-Reset computer last.
+Truth about load on this computer:
+  - Host process: node /home/box/sand-host/host-main.cjs via sand-supervisor.
+  - Stock launchHost() spawns HOST_ENTRY immediately — no prestart, no
+    sand-data hook, no NODE_OPTIONS.
+  - Wrap on disk is inert until a host process START already has the wrap.
+  - agent-data -> sand-data (symlink).
 
 Attach (Grok already chats; provider is cursor):
 
-  1. Copy from Explorer:
-       tools/brain-router.cjs      -> ~/sand-host/brain-router.cjs
-       tools/patch-brain-hook.py   -> ~/sand-data/patch-brain-hook.py
-       tools/brain-assign.py       -> ~/sand-data/brain-assign.py
+  1. Copy from Explorer (DURABLE under sand-data / agent-data —
+     sand-host is wiped on Computer recover / boot-fetch):
+       tools/brain-router.cjs                 -> ~/sand-data/brain-router.cjs
+       tools/patch-brain-hook.py              -> ~/sand-data/patch-brain-hook.py
+       tools/ensure-brain-overlay.py          -> ~/sand-data/ensure-brain-overlay.py
+       tools/host-prestart-ensure.sh          -> ~/sand-data/host-prestart-ensure.sh
+       tools/install-supervisor-prestart.py   -> ~/sand-data/install-supervisor-prestart.py
+       tools/supervisor-boot-fetch.py         -> ~/sand-data/supervisor-boot-fetch.py
+       tools/detect-hop-durability.py         -> ~/sand-data/detect-hop-durability.py
+       tools/brain-assign.py                  -> ~/sand-data/brain-assign.py
 
   2. printf 'DEEPSEEK_API_KEY=sk-...\n' > ~/sand-data/deepseek.env
      chmod 600 ~/sand-data/deepseek.env
 
-  3. python3 ~/sand-data/patch-brain-hook.py
-     Fully Quit Grok Bot, reopen, Create new Bot.
-     Do not restart-host.
+  3. Disk wrap (idempotent; FULL-file node --check; restore on failure):
+       python3 ~/sand-data/ensure-brain-overlay.py
 
-  4. grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8
-     Want brain=grok and where=none or where=store — not where=stream.
-     Dashboard must not move.
+  4. Wire supervisor so the NEXT launchHost re-applies before spawn
+     (fail-closed: ensure error still spawns stock Grok).
+     Live sand-supervisor.mjs is ESM root-owned under /usr/local/bin —
+     installer reuses module-level execFileSync/existsSync/join (no require),
+     backs up under sand-data (never a sibling .bak in /usr/local/bin), and
+     re-execs via `sudo -n` with absolute --sand/--tools (sudo sets HOME=/root).
+       python3 /home/box/sand-data/install-supervisor-prestart.py \
+         --sand /home/box/sand-data --tools /home/box/sand-data
+     Does not bounce. Does not Update Computer.
 
-  5. After a Bot intros: python3 ~/sand-data/brain-assign.py on <uuid>
+  5. Wrap becomes live only after a host process start that goes through
+     the patched launchHost (or otherwise starts a host-main that already
+     has the wrap on disk). Do not forceNow / restart-host to force that.
+
+  6. grep -F '[sand-brain]' /tmp/sand-host-manual.log | tail -n 8
+     Want brain=grok and where=none|store|stream. Dashboard must not move.
+
+  7. After a Bot intros: python3 ~/sand-data/brain-assign.py on <uuid>
      Next createSession with that id hops. Another Bot stays grok.
+
+After boot-fetch (sand-host swapped, supervisor binary KEPT):
+  If launchHost was patched, it runs ensure before spawn → wrap can return
+  without hand-editing host-main and without forceNow.
+
+Supervisor recycle — SAFE window (2026-09-01 live shape):
+  Upstream: shouldBootFetchHostBundle = (localVersion === imageSha).
+  When ~/sand-host/version != /etc/sand-box-image-sha, boot-fetch is DISARMED.
+  That is the window to recycle the supervisor process so prestart enters
+  memory without Cursor swapping sand-host mid-recycle.
+
+  Check (must exit 0 before recycle):
+    python3 ~/sand-data/supervisor-boot-fetch.py --check
+
+  Apply sequence (no bounce, no Update Computer):
+    python3 ~/sand-data/ensure-brain-overlay.py
+    python3 ~/sand-data/install-supervisor-prestart.py \
+      --sand /home/box/sand-data --tools /home/box/sand-data
+    # supervisor recycle while --check still passes
+    # next launchHost: ensure → wrap on current sand-host/version
+
+  Host-only bounce (supervisor PID unchanged): uses in-memory launchHost only.
+  Disk-only prestart does nothing until supervisor reloads — the overnight hop
+  hole when sand-host swapped without supervisor recycle.
+
+After Update Computer (image recover):
+  Supervisor is reset from the image → prestart patch is GONE.
+  Durable brain-router + bindings + ensure scripts under sand-data SURVIVE.
+  The wrap does NOT auto-come back. With the current Cursor supervisor there
+  is no durable automatic hook between image restore and first spawn.
+  Honest post-recover sequence (still no bounce as "apply"):
+    python3 ~/sand-data/detect-hop-durability.py
+    python3 ~/sand-data/ensure-brain-overlay.py
+    python3 ~/sand-data/install-supervisor-prestart.py \
+      --sand /home/box/sand-data --tools /home/box/sand-data
+  Then the wrap is on disk + supervisor is wired; it goes live on the next
+  host process start through launchHost — not via desktop quit.
 
 Daily (no restart):
   python3 ~/sand-data/brain-assign.py on|off <UUID>

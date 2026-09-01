@@ -124,3 +124,98 @@ grep -c "applyProviderReasoningControls" /home/box/sand-data/openai-hop-session.
 # then, in the app, send a normal message in the bound conversation:
 tcpdump -i lo port <hop-port>               # expect packets
 ```
+
+## Brain overlay survival (per-Bot DeepSeek hop)
+
+The `model-bindings.json` + `apply-box-patch.py` path above is Contract A/B for
+openai-hop sessions. The **per-Bot brain hop** (DeepSeek via `brain-router.cjs`)
+is a separate overlay — see `tools/BRAIN-SETUP.txt`.
+
+### What survives what
+
+| Path | Boot-fetch (sand-host swap) | Update Computer (image recover) |
+|---|---|---|
+| `~/sand-data/*` (bindings, `brain-router.cjs`, ensure, installer) | survives | survives |
+| `/home/box/agent-data` → symlink to sand-data | survives | survives |
+| `~/sand-host/host-main.cjs` wrap | wiped | wiped |
+| `/usr/local/bin/sand-supervisor.mjs` prestart patch | usually kept | **reset from image** |
+
+Stock supervisor `launchHost()` hardcodes
+`spawn(process.execPath, [HOST_ENTRY], { cwd: HOST_DIR, env: { … SAND_DATA_ROOT … }})`
+with **no** prestart, box-script, or `NODE_OPTIONS` hook. `SAND_DATA_ROOT` is a
+data-root env name only — stock host-main does not load `brain-router`.
+
+Desktop **Quit Grok Bot does not restart host-main** (client only). Wrap on
+disk is live only after a host process **start** that already has the wrap.
+
+### Disk patch + load wire
+
+```bash
+python3 /home/box/sand-data/ensure-brain-overlay.py              # wrap host-main on disk
+python3 /home/box/sand-data/install-supervisor-prestart.py \
+  --sand /home/box/sand-data --tools /home/box/sand-data          # patch launchHost (sudo -n)
+# wrap goes live on the NEXT host process start through patched launchHost
+# NEVER forceNow / adapters restart-host / Update Computer to apply
+```
+
+`install-supervisor-prestart.py` notes (live box):
+
+- `sand-supervisor.mjs` is `-rw-r--r-- root root` under `/usr/local/bin` — `box`
+  cannot write it or create a sibling `.bak` there. Backups go under
+  `--sand/brain-overlay-backups-*`.
+- When the file is not writable, the installer re-execs via `sudo -n` with
+  **absolute** `--sand` / `--tools` (sudo sets `HOME=/root`, so `~/sand-data`
+  would wrongly become `/root/sand-data`).
+- If passwordless sudo is unavailable, it dies with that permission fact —
+  never half-patches.
+
+- **Boot-fetch** with supervisor patch kept: launchHost re-runs ensure before
+  spawn → wrap can return automatically.
+- **Supervisor recycle (safe window):** when `~/sand-host/version` ≠
+  `/etc/sand-box-image-sha`, upstream `shouldBootFetchHostBundle` is false —
+  boot-fetch is **disarmed**. Recycling the supervisor process loads the
+  prestart patch from disk into memory without swapping sand-host. This is
+  the intended apply path after `install-supervisor-prestart.py`:
+  `python3 ~/sand-data/supervisor-boot-fetch.py --check` must exit 0 first.
+- **Host-only bounce** (supervisor PID unchanged): only helps if that process
+  already had prestart in memory. Disk-only prestart is inert until supervisor
+  reloads — the overnight hop hole when Cursor swapped sand-host without a
+  supervisor recycle.
+- **Supervisor process killed/restarted** (not just host-main): image supervisor
+  returns (stock, no prestart); boot-fetch may run — re-run installer from
+  sand-data. Do not use Update Computer as apply path.
+- **Update Computer recover:** supervisor is stock again. Hop **cannot
+  auto-restore** the wrap with the current Cursor supervisor (no durable hook
+  between image restore and first spawn). Re-run ensure +
+  `install-supervisor-prestart.py` from sand-data after recover. Optional:
+  `python3 ~/sand-data/detect-hop-durability.py` for a post-recover checklist.
+
+`ensure-brain-overlay.py` / `patch-brain-hook.py` support **both** stock shapes
+(prefer xAI locator when present; otherwise Cursor-native):
+
+| Shape | How we know | Wrap site |
+|---|---|---|
+| grok-bot-setup | `createXaiPromptSession` + `inferenceProvider !== "cursor"` | replace that if-block |
+| recovered Cursor-native (e.g. `112ba04`, `9a145a6`) | no xAI branch; `const session = createCursorInferencePromptSession({...}); return session;` beside `recordPostTurnLabeling` | wrap that call/return; load router from sand-data/agent-data; `nativeFactory` is the same invocation; harvest ids via `pickSandBrainIds` |
+
+If conversation id is empty at `createSession` (common on recovered hosts —
+`conversationIdKey` / `getConversationId` are out of scope), the router **defers**
+until `getExecutor` / `stream` (`where=stream`) instead of eagerly nailing native
+Grok. Bindings are keyed by **agent id** (Xian/Mei/Ted/Long Run); `resolveBrain`
+matches those UUIDs from `sessionOptions.agentId` / `options2.getAgentId()` / stream ctx.
+
+Fail-closed rules:
+
+1. **Durable router** — `brain-router.cjs` under sand-data/agent-data; host hook
+   uses `sand-brain durable-router` loader (fail → native).
+2. **Backup first** — timestamped dir under `sand-data/`.
+3. **FULL-file `node --check`** — never gate on a wrap slice alone (that hid
+   the leftover-`}` stale-upgrade corruption).
+4. **Restore on failure** — any post-write error restores `host-main`; never
+   leave a half patch.
+5. **Runtime** — hop create/key errors log loudly and fall back to native Grok;
+   unassigned bots never enter the hop path.
+6. **Keys stay off git** — `~/sand-data/deepseek.env` only (`chmod 600`).
+7. **Supervisor prestart** — `install-supervisor-prestart.py` inserts ensure
+   before spawn; ensure failure still spawns stock. Update Computer wipes it.
+8. **Never** forceNow / restart-host / Update Computer as the apply path.
