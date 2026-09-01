@@ -36,6 +36,10 @@ const {
   defaultBrainLogPath,
   logLine,
   LOG,
+  toChatMessages,
+  hasChatPayload,
+  makeHopStreamResult,
+  failClosedStreamResult,
 } = require("./brain-router.cjs");
 
 assert.strictEqual(
@@ -575,6 +579,7 @@ process.env.SAND_DATA = prevSand;
 process.env.DEEPSEEK_API_KEY = "sk-test";
 let hopUrl = "";
 let hopAuth = "";
+let hopBody = null;
 const hopSess = createDeepseekHopSession(
   {
     kind: "openai",
@@ -587,6 +592,7 @@ const hopSess = createDeepseekHopSession(
     hopFetch: (url, init) => {
       hopUrl = url;
       hopAuth = String((init && init.headers && init.headers.Authorization) || "");
+      hopBody = JSON.parse(init.body);
       return {
         ok: true,
         json: () => Promise.resolve({ choices: [{ message: { content: "sacred" } }] }),
@@ -601,47 +607,242 @@ const hopEx = hopSess.getExecutor([
 ]);
 assert.ok(hopEx.getMessages().some((m) => String(m.content).includes("[sand-brain]")));
 assert.ok(hopEx.getMessages().some((m) => m.role === "user" && m.content.includes("sacred geometry")));
-const hopPending = hopEx.stream();
-assert.ok(typeof hopPending.then === "function");
+const hopResult = hopEx.stream();
+// Bug 2: must be sync stream-result object, NOT a Promise.
+assert.strictEqual(typeof hopResult.then, "undefined");
+assert.ok(hopResult.fullStream);
+assert.ok(hopResult.response);
+assert.ok(hopResult.usage);
+assert.ok(hopResult.extendedUsage);
 assert.ok(hopUrl.indexOf("https://api.deepseek.com/v1/chat/completions") === 0);
 assert.ok(hopAuth.indexOf("Bearer sk-test") === 0);
-hopPending.catch(() => {});
+assert.ok(Array.isArray(hopBody.messages));
+assert.ok(hopBody.messages.some((m) => m.role === "user"));
 
-if (prevKey == null) delete process.env.DEEPSEEK_API_KEY;
-else process.env.DEEPSEEK_API_KEY = prevKey;
-delete process.env.DEEPSEEK_API_KEY;
-
-const createdNo = { ready: false, kind: "" };
-const lazyNoKey = createLazyBrainSession({
-  sessionOptions: { modelId: "grok-4.6" },
-  conversationIdKey: cidKey,
-  getConversationId: (ctx) => ctx && ctx.get(cidKey),
-  nativeFactory: () => fakeSession("native", createdNo),
-  hopFetch: () => {
-    throw new Error("fetch without key");
-  },
-});
-lazyNoKey.getExecutor([]).stream(new Map([[cidKey, LONG_RUN]]), "inv-nokey", []);
-assert.ok(createdNo.kind.startsWith("native"));
-
-// Hop factory throws → fail closed to native (never brick the createSession path).
-const createdBoom = { ready: false, kind: "" };
-const lazyBoom = createLazyBrainSession({
-  sessionOptions: { conversationId: LONG_RUN, modelId: "grok-4.6" },
-  nativeFactory: () => fakeSession("native-after-hop-boom", createdBoom),
-  createHopSession: () => {
-    throw new Error("simulated hop explode");
-  },
-});
-assert.strictEqual(createdBoom.kind, "native-after-hop-boom");
-assert.strictEqual(typeof lazyBoom.getExecutor, "function");
-
-// Durable hop-fail log defaults (BRAIN_LOG unset → sand-data/hop-fail-logs).
+// --- toChatMessages / OpenAI conversion ---
 {
-  const { spawnSync } = require("child_process");
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "brain-log-home-"));
-  fs.mkdirSync(path.join(home, "sand-data"));
-  const script = `
+  const textParts = toChatMessages([
+    { role: "user", content: [{ type: "text", text: "hello " }, { type: "text", text: "world" }] },
+  ]);
+  assert.deepStrictEqual(textParts, [{ role: "user", content: "hello world" }]);
+
+  const stringOnly = toChatMessages([{ role: "user", content: "ping" }]);
+  assert.deepStrictEqual(stringOnly, [{ role: "user", content: "ping" }]);
+
+  const empty = toChatMessages([]);
+  assert.deepStrictEqual(empty, []);
+  assert.strictEqual(hasChatPayload(empty), false);
+  assert.strictEqual(hasChatPayload([{ role: "system", content: "identity only" }]), false);
+
+  const toolPair = toChatMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "call_1", toolName: "lookup", args: { q: "x" } },
+      ],
+    },
+    {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "call_1", result: { ok: true } }],
+    },
+    { role: "user", content: "testing" },
+  ]);
+  assert.strictEqual(toolPair.length, 3);
+  assert.strictEqual(toolPair[0].role, "assistant");
+  assert.ok(Array.isArray(toolPair[0].tool_calls));
+  assert.strictEqual(toolPair[0].tool_calls[0].id, "call_1");
+  assert.strictEqual(toolPair[0].tool_calls[0].type, "function");
+  assert.strictEqual(toolPair[0].tool_calls[0].function.name, "lookup");
+  assert.strictEqual(toolPair[0].tool_calls[0].function.arguments, JSON.stringify({ q: "x" }));
+  assert.strictEqual(toolPair[1].role, "tool");
+  assert.strictEqual(toolPair[1].tool_call_id, "call_1");
+  assert.ok(!String(toolPair[0].content || "").includes("tool-call"));
+  assert.strictEqual(hasChatPayload(toolPair), true);
+}
+
+// makeHopStreamResult shape (not a Promise)
+{
+  const shaped = makeHopStreamResult(Promise.resolve({ text: "hi" }), "deepseek-v4-flash");
+  assert.strictEqual(typeof shaped.then, "undefined");
+  assert.ok(shaped.fullStream);
+  assert.ok(typeof shaped.response.then === "function");
+}
+
+function nativeStreamSession(marker) {
+  return {
+    getModelId: () => "mid-native",
+    getExecutor() {
+      return {
+        stream() {
+          marker.nativeStreamed = true;
+          return {
+            fullStream: (async function* () {
+              yield { type: "text-delta", textDelta: marker.text || "native-fallback" };
+            })(),
+            response: Promise.resolve({ modelId: "grok-native" }),
+            usage: Promise.resolve({ promptTokens: 0, completionTokens: 0 }),
+            extendedUsage: Promise.resolve({ promptTokens: 0, completionTokens: 0 }),
+          };
+        },
+        getMessages() {
+          return [];
+        },
+      };
+    },
+  };
+}
+
+(async () => {
+  const resp = await hopResult.response;
+  assert.ok(resp && typeof resp.modelId === "string" && resp.modelId.trim());
+  assert.strictEqual(resp.modelId.trim(), "deepseek-v4-flash");
+  const texts = [];
+  for await (const ev of hopResult.fullStream) {
+    if (ev && ev.type === "text-delta") texts.push(ev.textDelta);
+  }
+  assert.strictEqual(texts.join(""), "sacred");
+
+  process.env.DEEPSEEK_API_KEY = "sk-test";
+
+  // 200: hop yields assistant text; sanitize can trim modelId
+  const mark200 = { nativeStreamed: false, text: "native-fallback" };
+  const lazy200 = createLazyBrainSession({
+    sessionOptions: { conversationId: LONG_RUN, modelId: "grok-4.6" },
+    nativeFactory: () => nativeStreamSession(mark200),
+    hopFetch: () => ({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ choices: [{ message: { content: "from-hop" } }] }),
+    }),
+  });
+  const ex200 = lazy200.getExecutor([{ role: "user", content: "hi" }]);
+  const r200 = ex200.stream({}, "inv-200", []);
+  assert.strictEqual(typeof r200.then, "undefined");
+  assert.ok(r200.response && r200.fullStream);
+  const resp200 = await r200.response;
+  assert.ok(typeof resp200.modelId.trim() === "string" && resp200.modelId.trim());
+  const parts200 = [];
+  for await (const ev of r200.fullStream) {
+    if (ev && ev.type === "text-delta") parts200.push(ev.textDelta);
+  }
+  assert.strictEqual(parts200.join(""), "from-hop");
+
+  // 400: fail closed to native; response.modelId.trim() must not throw
+  const mark400 = { nativeStreamed: false, text: "native-after-400" };
+  const lazy400 = createLazyBrainSession({
+    sessionOptions: { conversationId: LONG_RUN, modelId: "grok-4.6" },
+    nativeFactory: () => nativeStreamSession(mark400),
+    hopFetch: () => ({
+      ok: false,
+      status: 400,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            error: {
+              message:
+                "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
+            },
+          })
+        ),
+    }),
+  });
+  const ex400 = lazy400.getExecutor([
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", toolCallId: "c1", toolName: "t", args: {} }],
+    },
+    {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "c1", result: "ok" }],
+    },
+    { role: "user", content: "testing" },
+  ]);
+  const r400 = ex400.stream({}, "inv-400", []);
+  assert.strictEqual(typeof r400.then, "undefined");
+  assert.ok(r400.response);
+  const [response2, usage2] = await Promise.all([r400.response, r400.extendedUsage]);
+  assert.ok(response2 && typeof response2.modelId === "string");
+  assert.strictEqual(response2.modelId.trim(), "grok-native");
+  assert.ok(usage2);
+  const parts400 = [];
+  for await (const ev of r400.fullStream) {
+    if (ev && ev.type === "text-delta") parts400.push(ev.textDelta);
+  }
+  assert.strictEqual(parts400.join(""), "native-after-400");
+  assert.strictEqual(mark400.nativeStreamed, true);
+
+  // empty / system-only → no POST; fail closed to native
+  let emptyPosted = false;
+  const markEmpty = { nativeStreamed: false, text: "native-empty" };
+  const lazyEmpty = createLazyBrainSession({
+    sessionOptions: { conversationId: LONG_RUN, modelId: "grok-4.6" },
+    nativeFactory: () => nativeStreamSession(markEmpty),
+    hopFetch: () => {
+      emptyPosted = true;
+      return {
+        ok: true,
+        json: () => Promise.resolve({ choices: [{ message: { content: "x" } }] }),
+      };
+    },
+  });
+  const emptyEx = lazyEmpty.getExecutor([]);
+  const rEmpty = emptyEx.stream({}, "inv-empty", []);
+  assert.strictEqual(typeof rEmpty.then, "undefined");
+  const respEmpty = await rEmpty.response;
+  assert.strictEqual(respEmpty.modelId.trim(), "grok-native");
+  assert.strictEqual(emptyPosted, false);
+
+  // Promise-shaped hop → immediate native (Bug 2 harness shape)
+  const nativeSync = failClosedStreamResult(
+    Promise.resolve("bad"),
+    function () {
+      return {
+        fullStream: (async function* () {})(),
+        response: Promise.resolve({ modelId: "n" }),
+        usage: Promise.resolve({}),
+        extendedUsage: Promise.resolve({}),
+      };
+    },
+    []
+  );
+  assert.strictEqual(typeof nativeSync.then, "undefined");
+  assert.ok(nativeSync.response);
+  const nr = await nativeSync.response;
+  assert.strictEqual(nr.modelId, "n");
+
+  if (prevKey == null) delete process.env.DEEPSEEK_API_KEY;
+  else process.env.DEEPSEEK_API_KEY = prevKey;
+  delete process.env.DEEPSEEK_API_KEY;
+
+  const createdNo = { ready: false, kind: "" };
+  const lazyNoKey = createLazyBrainSession({
+    sessionOptions: { modelId: "grok-4.6" },
+    conversationIdKey: cidKey,
+    getConversationId: (ctx) => ctx && ctx.get(cidKey),
+    nativeFactory: () => fakeSession("native", createdNo),
+    hopFetch: () => {
+      throw new Error("fetch without key");
+    },
+  });
+  lazyNoKey.getExecutor([]).stream(new Map([[cidKey, LONG_RUN]]), "inv-nokey", []);
+  assert.ok(createdNo.kind.startsWith("native"));
+
+  const createdBoom = { ready: false, kind: "" };
+  const lazyBoom = createLazyBrainSession({
+    sessionOptions: { conversationId: LONG_RUN, modelId: "grok-4.6" },
+    nativeFactory: () => fakeSession("native-after-hop-boom", createdBoom),
+    createHopSession: () => {
+      throw new Error("simulated hop explode");
+    },
+  });
+  assert.strictEqual(createdBoom.kind, "native-after-hop-boom");
+  assert.strictEqual(typeof lazyBoom.getExecutor, "function");
+
+  {
+    const { spawnSync } = require("child_process");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "brain-log-home-"));
+    fs.mkdirSync(path.join(home, "sand-data"));
+    const script = `
     delete process.env.BRAIN_LOG;
     process.env.HOME = ${JSON.stringify(home)};
     process.env.BRAIN_BINDINGS = ${JSON.stringify(bindings)};
@@ -656,20 +857,19 @@ assert.strictEqual(typeof lazyBoom.getExecutor, "function");
     if (!fs.existsSync(p)) process.exit(6);
     if (!fs.readFileSync(p, "utf8").includes("durable-default-ok")) process.exit(7);
   `;
-  const r = spawnSync(process.execPath, ["-e", script], {
-    encoding: "utf8",
-    env: { ...process.env, HOME: home },
-  });
-  assert.strictEqual(r.status, 0, r.stderr || r.stdout);
-}
+    const r = spawnSync(process.execPath, ["-e", script], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home },
+    });
+    assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+  }
 
-// BRAIN_LOG override wins.
-{
-  const { spawnSync } = require("child_process");
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "brain-log-ovr-"));
-  fs.mkdirSync(path.join(home, "sand-data"));
-  const custom = path.join(home, "custom-brain.log");
-  const script = `
+  {
+    const { spawnSync } = require("child_process");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "brain-log-ovr-"));
+    fs.mkdirSync(path.join(home, "sand-data"));
+    const custom = path.join(home, "custom-brain.log");
+    const script = `
     process.env.HOME = ${JSON.stringify(home)};
     process.env.BRAIN_LOG = ${JSON.stringify(custom)};
     process.env.BRAIN_BINDINGS = ${JSON.stringify(bindings)};
@@ -677,15 +877,14 @@ assert.strictEqual(typeof lazyBoom.getExecutor, "function");
     if (m.LOG !== ${JSON.stringify(custom)}) process.exit(2);
     m.logLine("override-ok");
   `;
-  const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
-  assert.strictEqual(r.status, 0, r.stderr || r.stdout);
-  assert.ok(fs.readFileSync(custom, "utf8").includes("override-ok"));
-}
+    const r = spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+    assert.strictEqual(r.status, 0, r.stderr || r.stdout);
+    assert.ok(fs.readFileSync(custom, "utf8").includes("override-ok"));
+  }
 
-// Missing parent dir: logLine must not throw (mkdir best-effort / fail-closed).
-{
   logLine("no-throw-check");
-  assert.ok(true);
-}
-
-console.log("ok");
+  console.log("ok");
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

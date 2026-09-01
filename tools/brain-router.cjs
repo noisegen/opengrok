@@ -436,16 +436,335 @@ function loadHopKey(brain) {
   return "";
 }
 
+function partText(part) {
+  if (part == null) return "";
+  if (typeof part === "string") return part;
+  if (typeof part !== "object") return String(part);
+  if (typeof part.text === "string") return part.text;
+  if (typeof part.content === "string") return part.content;
+  return "";
+}
+
+function stringifyArgs(args) {
+  if (typeof args === "string") return args;
+  try {
+    return JSON.stringify(args == null ? {} : args);
+  } catch {
+    return "{}";
+  }
+}
+
+/**
+ * Convert AI-SDK / Grok core messages to OpenAI chat.completions messages.
+ * Preserves assistant tool_calls before role:tool (DeepSeek 400 otherwise).
+ * Never JSON.stringifies whole part arrays into content.
+ */
 function toChatMessages(list) {
-  return (Array.isArray(list) ? list : []).map((m) => ({
-    role: (m && m.role) || "user",
-    content:
-      m && typeof m.content === "string"
-        ? m.content
-        : m && m.content != null
-          ? JSON.stringify(m.content)
-          : "",
-  }));
+  const out = [];
+  for (const m of Array.isArray(list) ? list : []) {
+    if (!m || typeof m !== "object") continue;
+    const role = m.role || "user";
+    const content = m.content;
+    const parts = Array.isArray(content)
+      ? content
+      : Array.isArray(m.parts)
+        ? m.parts
+        : null;
+
+    if (role === "tool" || role === "function") {
+      let id = m.tool_call_id || m.toolCallId || "";
+      let c = content;
+      if (parts) {
+        for (const part of parts) {
+          if (!part || typeof part !== "object") continue;
+          const t = part.type;
+          if (t === "tool-result" || t === "tool_result") {
+            if (!id) id = part.toolCallId || part.tool_call_id || part.id || "";
+            let result =
+              part.result != null
+                ? part.result
+                : part.output != null
+                  ? part.output
+                  : part.content;
+            if (typeof result !== "string") result = stringifyArgs(result);
+            c = result;
+          } else {
+            const s = partText(part);
+            if (s) c = typeof c === "string" && c ? c + s : s;
+          }
+        }
+      } else if (Array.isArray(c)) {
+        c = c.map(partText).filter(Boolean).join("") || stringifyArgs(c);
+      } else if (typeof c !== "string") {
+        c = c != null ? stringifyArgs(c) : "";
+      }
+      if (!id) continue;
+      out.push({ role: "tool", tool_call_id: String(id), content: c == null ? "" : String(c) });
+      continue;
+    }
+
+    if (role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const msg = { role: "assistant", tool_calls: m.tool_calls, content: null };
+      if (typeof content === "string" && content) msg.content = content;
+      else if (parts) {
+        const texts = parts.map(partText).filter(Boolean);
+        if (texts.length) msg.content = texts.join("");
+      }
+      out.push(msg);
+      continue;
+    }
+
+    if (parts) {
+      const texts = [];
+      const toolCalls = [];
+      const toolResults = [];
+      for (const part of parts) {
+        if (part == null) continue;
+        if (typeof part !== "object") {
+          const t = partText(part);
+          if (t) texts.push(t);
+          continue;
+        }
+        const t = part.type;
+        if (t === "text" || t === "input_text" || t === "output_text") {
+          const s = partText(part);
+          if (s) texts.push(s);
+        } else if (t === "tool-call" || t === "tool_call") {
+          const id = part.toolCallId || part.tool_call_id || part.id;
+          const name =
+            part.toolName ||
+            part.tool_name ||
+            (part.function && part.function.name) ||
+            "";
+          const args =
+            part.args != null
+              ? part.args
+              : part.arguments != null
+                ? part.arguments
+                : part.function && part.function.arguments;
+          if (id && name) {
+            toolCalls.push({
+              id: String(id),
+              type: "function",
+              function: { name: String(name), arguments: stringifyArgs(args) },
+            });
+          }
+        } else if (t === "tool-result" || t === "tool_result") {
+          const id = part.toolCallId || part.tool_call_id || part.id;
+          let result =
+            part.result != null
+              ? part.result
+              : part.output != null
+                ? part.output
+                : part.content;
+          if (typeof result !== "string") result = stringifyArgs(result);
+          if (id) {
+            toolResults.push({
+              role: "tool",
+              tool_call_id: String(id),
+              content: result,
+            });
+          }
+        } else {
+          const s = partText(part);
+          if (s) texts.push(s);
+        }
+      }
+      if (toolCalls.length) {
+        out.push({
+          role: "assistant",
+          content: texts.length ? texts.join("") : null,
+          tool_calls: toolCalls,
+        });
+      } else if (texts.length) {
+        out.push({ role: role === "assistant" ? "assistant" : role, content: texts.join("") });
+      }
+      for (const tr of toolResults) out.push(tr);
+      continue;
+    }
+
+    if (typeof content === "string") {
+      if (!content && role !== "assistant") continue;
+      out.push({ role, content });
+      continue;
+    }
+
+    // Skip unknown non-string content (do not dump objects into content).
+  }
+  return out;
+}
+
+function hasChatPayload(messages) {
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m) continue;
+    const role = m.role || "";
+    // System-only identity is not enough to POST; need user/assistant/tool payload.
+    if (role === "system") continue;
+    if (role === "tool" && m.tool_call_id) return true;
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length) return true;
+    if (typeof m.content === "string" && m.content.trim()) return true;
+  }
+  return false;
+}
+
+function redactHopSnippet(s) {
+  return String(s || "")
+    .replace(/sk-[A-Za-z0-9._-]{8,}/g, "[redacted]")
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .slice(0, 300);
+}
+
+async function readHopHttpError(res) {
+  const status = (res && res.status) || 0;
+  let raw = "";
+  try {
+    if (res && typeof res.text === "function") raw = await res.text();
+  } catch {
+    raw = "";
+  }
+  let message = "";
+  try {
+    const j = JSON.parse(raw);
+    const err = j && j.error;
+    message =
+      (err && (err.message || err.code || err.type)) ||
+      (typeof j.message === "string" ? j.message : "") ||
+      "";
+  } catch {
+    message = raw;
+  }
+  return { status, message: redactHopSnippet(message) };
+}
+
+/**
+ * Native executor.stream() returns a stream-result OBJECT synchronously
+ * (fullStream / response / usage / extendedUsage). Returning a Promise
+ * makes UsageSanitizingMiddleware read undefined.modelId and kill inference.
+ */
+function makeHopStreamResult(innerPromise, model) {
+  const modelId = String(model || "deepseek-v4-flash");
+  const inner = Promise.resolve(innerPromise);
+  const response = inner.then(() => ({ modelId }));
+  const usage = inner.then(() => ({ promptTokens: 0, completionTokens: 0 }));
+  const extendedUsage = inner.then(() => ({ promptTokens: 0, completionTokens: 0 }));
+  // Derived promises reject when hop fails; swallow until failClosed / caller attaches.
+  inner.catch(() => {});
+  response.catch(() => {});
+  usage.catch(() => {});
+  extendedUsage.catch(() => {});
+
+  return {
+    fullStream: (async function* () {
+      const data = await inner;
+      const text = (data && data.text) || "";
+      if (text) {
+        yield { type: "text-delta", textDelta: text };
+      }
+    })(),
+    response,
+    usage,
+    extendedUsage,
+  };
+}
+
+function rejectHopStreamResult(err, model) {
+  const modelId = String(model || "deepseek-v4-flash");
+  const rejected = Promise.reject(err);
+  const response = rejected;
+  const usage = rejected;
+  const extendedUsage = rejected;
+  rejected.catch(() => {});
+  return {
+    fullStream: (async function* () {
+      await rejected;
+    })(),
+    response,
+    usage,
+    extendedUsage,
+    modelId,
+  };
+}
+
+/**
+ * If hop stream-result fails (HTTP/empty), fall back to native origStream.
+ * Always returns a sync value (never a raw Promise from hop).
+ * Opaque sync returns from custom createHopSession (tests/legacy) pass through.
+ */
+function failClosedStreamResult(hopResult, origStream, args) {
+  if (!origStream) return hopResult;
+
+  // Bug 2: hop.stream() must not return a Promise to the harness.
+  if (hopResult != null && typeof hopResult.then === "function") {
+    try {
+      hopResult.catch(() => {});
+    } catch {
+      /* ignore */
+    }
+    logLine("hop stream not a stream-result -> native");
+    return origStream.apply(null, args);
+  }
+
+  // Proper stream-result: wrap so async HTTP/empty rejection uses native.
+  if (
+    hopResult &&
+    typeof hopResult === "object" &&
+    hopResult.response &&
+    hopResult.fullStream
+  ) {
+    let nativeResult = null;
+    const getNative = () => {
+      if (!nativeResult) nativeResult = origStream.apply(null, args);
+      return nativeResult;
+    };
+
+    // Swallow hop-side rejections until decided chooses.
+    Promise.resolve(hopResult.response).catch(() => {});
+    Promise.resolve(hopResult.usage).catch(() => {});
+    Promise.resolve(hopResult.extendedUsage).catch(() => {});
+
+    const decided = Promise.resolve(hopResult.response).then(
+      () => ({ kind: "hop", result: hopResult }),
+      (err) => {
+        logLine("hop stream failed -> native: " + ((err && err.message) || err));
+        return { kind: "native", result: getNative() };
+      }
+    );
+
+    return {
+      fullStream: (async function* () {
+        const d = await decided;
+        const r = d.result;
+        if (!r || typeof r !== "object" || !r.fullStream) return;
+        for await (const ev of r.fullStream) yield ev;
+      })(),
+      response: decided.then(async (d) => {
+        const r = d.result;
+        if (r && typeof r === "object" && r.response != null) {
+          return typeof r.response.then === "function" ? await r.response : r.response;
+        }
+        return { modelId: "native" };
+      }),
+      usage: decided.then(async (d) => {
+        const r = d.result;
+        if (r && typeof r === "object" && r.usage != null) {
+          return typeof r.usage.then === "function" ? await r.usage : r.usage;
+        }
+        return { promptTokens: 0, completionTokens: 0 };
+      }),
+      extendedUsage: decided.then(async (d) => {
+        const r = d.result;
+        if (r && typeof r === "object" && r.extendedUsage != null) {
+          return typeof r.extendedUsage.then === "function"
+            ? await r.extendedUsage
+            : r.extendedUsage;
+        }
+        return { promptTokens: 0, completionTokens: 0 };
+      }),
+    };
+  }
+
+  // Opaque sync hop return (string / custom) — pass through unchanged.
+  return hopResult;
 }
 
 function createDeepseekHopSession(brain, opts) {
@@ -454,7 +773,10 @@ function createDeepseekHopSession(brain, opts) {
     logLine("hop no-key -> native");
     return null;
   }
-  const base = String((brain && brain.baseUrl) || "https://api.deepseek.com/v1").replace(/\/+$/, "");
+  const base = String((brain && brain.baseUrl) || "https://api.deepseek.com/v1").replace(
+    /\/+$/,
+    ""
+  );
   const model = (brain && brain.model) || "deepseek-v4-flash";
   const fetchFn = (opts && opts.hopFetch) || globalThis.fetch;
   if (typeof fetchFn !== "function") {
@@ -487,29 +809,41 @@ function createDeepseekHopSession(brain, opts) {
           if (Array.isArray(next)) messages = messages.concat(next);
         },
         stream: function () {
-          return Promise.resolve(
-            fetchFn(base + "/chat/completions", {
-              method: "POST",
-              headers: {
-                Authorization: "Bearer " + key,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                model,
-                messages: toChatMessages(messages),
-                stream: false,
-              }),
-            })
-          ).then((res) => {
+          const chatMessages = toChatMessages(messages);
+          if (!hasChatPayload(chatMessages)) {
+            logLine("hop empty messages -> fail-closed");
+            return rejectHopStreamResult(new Error("hop empty messages"), model);
+          }
+          const inner = (async () => {
+            const res = await Promise.resolve(
+              fetchFn(base + "/chat/completions", {
+                method: "POST",
+                headers: {
+                  Authorization: "Bearer " + key,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  model,
+                  messages: chatMessages,
+                  stream: false,
+                }),
+              })
+            );
             if (!res || !res.ok) {
-              throw new Error("hop http " + (res && res.status));
+              const info = await readHopHttpError(res);
+              logLine(
+                "hop http " + info.status + (info.message ? ": " + info.message : "")
+              );
+              throw new Error(
+                "hop http " + info.status + (info.message ? ": " + info.message : "")
+              );
             }
-            return typeof res.json === "function" ? res.json() : res;
-          }).then((json) => {
+            const json = typeof res.json === "function" ? await res.json() : res;
             const choice = json && json.choices && json.choices[0];
             const msg = choice && choice.message;
-            return (msg && msg.content) || "";
-          });
+            return { text: (msg && msg.content) || "", modelId: model };
+          })();
+          return makeHopStreamResult(inner, model);
         },
       };
     },
@@ -558,7 +892,49 @@ function materializeSession(opts, convId) {
   const brain = resolveBrain(so, opts.requestedModel);
   if (brain && brain.kind !== "native") {
     const hop = brandedHop(opts, so, brain);
-    if (hop) return hop;
+    if (hop) {
+      // Lazy native: only materialize if hop stream fails closed.
+      let nativeSess = null;
+      const getNative = () => {
+        if (!nativeSess) {
+          nativeSess = openNative(
+            Object.assign({}, opts, { sessionOptions: so }),
+            opts.onRequestId
+          );
+        }
+        return nativeSess;
+      };
+      const hopGetExecutor =
+        typeof hop.getExecutor === "function" ? hop.getExecutor.bind(hop) : null;
+      return proxyObject(hop, {
+        getExecutor: function (initialMessages) {
+          const hex = hopGetExecutor
+            ? hopGetExecutor.apply(hop, arguments)
+            : null;
+          if (!hex || typeof hex.stream !== "function") {
+            const n = getNative();
+            return n.getExecutor.apply(n, arguments);
+          }
+          const execArgs = arguments;
+          const origStream = function () {
+            const n = getNative();
+            const nex = n.getExecutor.apply(n, execArgs);
+            return nex.stream.apply(nex, arguments);
+          };
+          return proxyObject(hex, {
+            stream: function () {
+              try {
+                const hopResult = hex.stream.apply(hex, arguments);
+                return failClosedStreamResult(hopResult, origStream, arguments);
+              } catch (err) {
+                logLine("alt stream failed, native: " + (err && err.message));
+                return origStream.apply(null, arguments);
+              }
+            },
+          });
+        },
+      });
+    }
     logLine("hop unavailable -> native");
   }
   if (typeof opts.nativeFactory === "function") {
@@ -599,17 +975,22 @@ function wrapExecutor(ex, onStream, initialMessages, altExecutor) {
   return proxyObject(ex, {
     stream: function (ctx) {
       if (typeof onStream === "function") onStream(ctx);
+      const args = arguments;
       try {
         const seed = snapshotMessages(ex, initialMessages);
         const alt = typeof altExecutor === "function" ? altExecutor(seed) : null;
         if (alt && typeof alt.stream === "function") {
-          return alt.stream.apply(alt, arguments);
+          const hopResult = alt.stream.apply(alt, args);
+          if (origStream) {
+            return failClosedStreamResult(hopResult, origStream, args);
+          }
+          return hopResult;
         }
       } catch (err) {
         logLine("alt stream failed, native: " + (err && err.message));
       }
       if (!origStream) throw new Error("sand-brain: no stream");
-      return origStream.apply(null, arguments);
+      return origStream.apply(null, args);
     },
   });
 }
@@ -701,20 +1082,25 @@ function createDeferredHopSession(opts) {
       const origStream = typeof ex.stream === "function" ? ex.stream.bind(ex) : null;
       return proxyObject(ex, {
         stream: function (ctx) {
+          const args = arguments;
           try {
-            const hop = tryHop("stream", arguments, ctx);
+            const hop = tryHop("stream", args, ctx);
             if (hop && typeof hop.getExecutor === "function") {
               const seed = snapshotMessages(ex, initialMessages);
               const hex = hop.getExecutor(seed);
               if (hex && typeof hex.stream === "function") {
-                return hex.stream.apply(hex, arguments);
+                const hopResult = hex.stream.apply(hex, args);
+                if (origStream) {
+                  return failClosedStreamResult(hopResult, origStream, args);
+                }
+                return hopResult;
               }
             }
           } catch (err) {
             logLine("stream hop failed, native: " + ((err && err.message) || err));
           }
           if (!origStream) throw new Error("sand-brain: no stream");
-          return origStream.apply(null, arguments);
+          return origStream.apply(null, args);
         },
       });
     },
@@ -800,6 +1186,10 @@ module.exports = {
   createBrandedSession,
   createDeepseekHopSession,
   loadHopKey,
+  toChatMessages,
+  hasChatPayload,
+  makeHopStreamResult,
+  failClosedStreamResult,
   STOCK_PROVIDERS,
   LIVE_BRAINS,
   defaultBrainLogPath,
